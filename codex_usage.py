@@ -229,7 +229,7 @@ def parse_date(value: str, tzinfo) -> datetime:
 def parse_duration(value: str) -> timedelta:
     match = re.fullmatch(r"\s*(\d+)\s*([hdwm])\s*", value.lower())
     if not match:
-        raise argparse.ArgumentTypeError("duration must look like 24h, 7d, 2w, or 3m")
+        raise argparse.ArgumentTypeError("duration must look like 24h, 7d, 30d, 2w, or 3m")
     amount = int(match.group(1))
     unit = match.group(2)
     if unit == "h":
@@ -665,7 +665,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Show local Codex token usage from ~/.codex rollout logs.",
     )
     window = parser.add_mutually_exclusive_group()
-    window.add_argument("--last", default="7d", help="rolling window: 24h, 7d, 2w, 3m (default: 7d)")
+    window.add_argument("--last", default="30d", help="rolling window: 24h, 7d, 30d, 2w, 3m (default: 30d)")
     window.add_argument("--today", action="store_true", help="show usage since local midnight")
     window.add_argument("--yesterday", action="store_true", help="show yesterday's usage")
     window.add_argument("--week", action="store_true", help="show current calendar week")
@@ -695,7 +695,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    if (args.since or args.until) and args.last != "7d":
+    if (args.since or args.until) and args.last != "30d":
         parser.error("--since/--until cannot be combined with --last")
 
     start, end, timeframe_label = resolve_timeframe(args)

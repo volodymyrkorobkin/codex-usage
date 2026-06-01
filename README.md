@@ -13,7 +13,7 @@ It runs entirely locally. It does not call external APIs.
 - Daily, weekly, monthly, and per-session reports.
 - Model, reasoning effort, and collaboration mode attribution when present in
   Codex `turn_context` events.
-- Rolling windows such as `24h`, `7d`, `2w`, and `3m`.
+- Rolling windows such as `24h`, `7d`, `30d`, `2w`, and `3m`.
 - Explicit date ranges with `--since` and `--until`.
 - JSON output for scripting.
 - Estimated `Cost (USD)` column using configurable assumptions in the source.
@@ -61,9 +61,12 @@ python3 codex_usage.py
 ## Examples
 
 ```sh
-# Rolling last 7 days, grouped by day
+# Rolling last 30 days, grouped by day
 codex-usage
+
+# Explicit rolling windows
 codex-usage --last 7d
+codex-usage --last 30d
 
 # Today
 codex-usage --today
@@ -99,7 +102,7 @@ codex-usage --codex-home /path/to/.codex
 ```
 
 Supported duration units for `--last`: `h`, `d`, `w`, `m`.
-Examples: `24h`, `7d`, `2w`, `3m`.
+Examples: `24h`, `7d`, `30d`, `2w`, `3m`.
 
 ## Output Columns
 

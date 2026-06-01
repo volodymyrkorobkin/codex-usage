@@ -51,6 +51,19 @@ def turn_context(
 
 
 class CodexUsageTests(unittest.TestCase):
+    def test_default_window_is_last_30_days(self) -> None:
+        parser = codex_usage.build_parser()
+        args = parser.parse_args([])
+
+        start, end, label = codex_usage.resolve_timeframe(
+            args,
+            now=datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(args.last, "30d")
+        self.assertEqual(label, "Last 30d")
+        self.assertEqual(end - start, codex_usage.parse_duration("30d"))
+
     def test_rollup_uses_cumulative_delta_within_window(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / "rollout-2026-06-01T00-00-00-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl"
