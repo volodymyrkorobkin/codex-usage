@@ -11,6 +11,8 @@ It runs entirely locally. It does not call external APIs.
 ## Features
 
 - Daily, weekly, monthly, and per-session reports.
+- Model, reasoning effort, and collaboration mode attribution when present in
+  Codex `turn_context` events.
 - Rolling windows such as `24h`, `7d`, `2w`, and `3m`.
 - Explicit date ranges with `--since` and `--until`.
 - JSON output for scripting.
@@ -81,9 +83,13 @@ codex-usage --since 2026-05-25 --until 2026-06-01
 # Biggest sessions in a rolling window
 codex-usage --last 7d --group-by session --limit 10
 
-# Group by week or month
+# Group by week, month, model, reasoning effort, or mode
 codex-usage --last 3m --group-by week
 codex-usage --last 6m --group-by month
+codex-usage --last 7d --group-by model
+codex-usage --last 7d --group-by effort
+codex-usage --last 7d --group-by mode
+codex-usage --last 7d --group-by model-effort
 
 # JSON output
 codex-usage --last 7d --json
@@ -97,6 +103,10 @@ Examples: `24h`, `7d`, `2w`, `3m`.
 
 ## Output Columns
 
+- `Models`: model names from the most recent `turn_context` before each token
+  event, such as `gpt-5.5`.
+- `Efforts`: reasoning effort from `turn_context`, such as `xhigh`.
+- `Modes`: collaboration mode from `turn_context`, such as `default` or `plan`.
 - `Input`: total input tokens reported by Codex.
 - `Cached Input`: cached input tokens, which are part of `Input`.
 - `Uncached`: `Input - Cached Input`.
@@ -162,8 +172,10 @@ session ids may reveal workflow details.
 
 - Codex rollout log formats are not a public stability contract and may change.
 - Estimated costs are not billing records.
-- The tool currently reports token usage only; it does not infer exact model
-  routing or service-tier multipliers from Codex sessions.
+- Model, effort, and mode are inferred from structured `turn_context` records.
+  Older logs without those records will show `unknown`.
+- Codex logs do not currently expose a reliable historical service tier per
+  token event, so the tool does not claim whether a past event used `fast`.
 
 ## License
 

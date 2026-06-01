@@ -26,6 +26,30 @@ def token_event(timestamp: str, total: dict[str, int], last: dict[str, int] | No
     return json.dumps(payload)
 
 
+def turn_context(
+    timestamp: str,
+    model: str = "gpt-5.5",
+    effort: str = "xhigh",
+    mode: str = "default",
+) -> str:
+    payload = {
+        "timestamp": timestamp,
+        "type": "turn_context",
+        "payload": {
+            "model": model,
+            "effort": effort,
+            "collaboration_mode": {
+                "mode": mode,
+                "settings": {
+                    "model": model,
+                    "reasoning_effort": effort,
+                },
+            },
+        },
+    }
+    return json.dumps(payload)
+
+
 class CodexUsageTests(unittest.TestCase):
     def test_rollup_uses_cumulative_delta_within_window(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -152,6 +176,106 @@ class CodexUsageTests(unittest.TestCase):
         self.assertEqual(report.rows[0].sessions, 1)
         self.assertEqual(report.rows[0].usage.total_tokens, 270)
 
+    def test_token_events_inherit_latest_turn_context_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "rollout-2026-06-01T00-00-00-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl"
+            log.write_text(
+                "\n".join(
+                    [
+                        turn_context(
+                            "2026-06-01T00:01:00Z",
+                            model="gpt-5.4",
+                            effort="high",
+                            mode="plan",
+                        ),
+                        token_event(
+                            "2026-06-01T00:02:00Z",
+                            {
+                                "input_tokens": 80,
+                                "cached_input_tokens": 20,
+                                "output_tokens": 20,
+                                "reasoning_output_tokens": 5,
+                                "total_tokens": 100,
+                            },
+                        ),
+                        turn_context(
+                            "2026-06-01T00:03:00Z",
+                            model="gpt-5.5",
+                            effort="xhigh",
+                            mode="default",
+                        ),
+                        token_event(
+                            "2026-06-01T00:04:00Z",
+                            {
+                                "input_tokens": 230,
+                                "cached_input_tokens": 120,
+                                "output_tokens": 70,
+                                "reasoning_output_tokens": 25,
+                                "total_tokens": 300,
+                            },
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            report = codex_usage.build_report(
+                roots=[Path(tmp)],
+                start=datetime(2026, 6, 1, 0, 0, tzinfo=timezone.utc),
+                end=datetime(2026, 6, 2, 0, 0, tzinfo=timezone.utc),
+                group_by="day",
+            )
+
+        self.assertEqual(len(report.rows), 1)
+        self.assertEqual(report.rows[0].usage.total_tokens, 300)
+        self.assertEqual(report.rows[0].models, ("gpt-5.4", "gpt-5.5"))
+        self.assertEqual(report.rows[0].efforts, ("high", "xhigh"))
+        self.assertEqual(report.rows[0].modes, ("default", "plan"))
+
+    def test_group_by_model_effort_uses_context_attribution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "rollout-2026-06-01T00-00-00-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl"
+            log.write_text(
+                "\n".join(
+                    [
+                        turn_context("2026-06-01T00:01:00Z", model="gpt-5.4", effort="high"),
+                        token_event(
+                            "2026-06-01T00:02:00Z",
+                            {
+                                "input_tokens": 100,
+                                "cached_input_tokens": 20,
+                                "output_tokens": 10,
+                                "reasoning_output_tokens": 3,
+                                "total_tokens": 110,
+                            },
+                        ),
+                        turn_context("2026-06-01T00:03:00Z", model="gpt-5.5", effort="xhigh"),
+                        token_event(
+                            "2026-06-01T00:04:00Z",
+                            {
+                                "input_tokens": 300,
+                                "cached_input_tokens": 100,
+                                "output_tokens": 30,
+                                "reasoning_output_tokens": 8,
+                                "total_tokens": 330,
+                            },
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            report = codex_usage.build_report(
+                roots=[Path(tmp)],
+                start=datetime(2026, 6, 1, 0, 0, tzinfo=timezone.utc),
+                end=datetime(2026, 6, 2, 0, 0, tzinfo=timezone.utc),
+                group_by="model-effort",
+            )
+
+        rows = {row.label: row for row in report.rows}
+        self.assertEqual(rows["gpt-5.4 · high"].usage.total_tokens, 110)
+        self.assertEqual(rows["gpt-5.5 · xhigh"].usage.total_tokens, 220)
+
     def test_render_table_includes_title_header_and_total_row(self) -> None:
         usage = codex_usage.Usage(
             input_tokens=1200,
@@ -165,7 +289,16 @@ class CodexUsageTests(unittest.TestCase):
             start=datetime(2026, 6, 1, 0, 0, tzinfo=timezone.utc),
             end=datetime(2026, 6, 2, 0, 0, tzinfo=timezone.utc),
             group_by="day",
-            rows=[codex_usage.ReportRow(label="2026-06-01", usage=usage, sessions=1)],
+            rows=[
+                codex_usage.ReportRow(
+                    label="2026-06-01",
+                    usage=usage,
+                    sessions=1,
+                    models=("gpt-5.5",),
+                    efforts=("xhigh",),
+                    modes=("default",),
+                )
+            ],
             totals=usage,
             sessions_counted=1,
             files_counted=1,
@@ -176,6 +309,10 @@ class CodexUsageTests(unittest.TestCase):
 
         self.assertIn("Codex Token Usage Report - Daily", rendered)
         self.assertIn("Date", rendered)
+        self.assertIn("Models", rendered)
+        self.assertIn("Efforts", rendered)
+        self.assertIn("Modes", rendered)
+        self.assertIn("gpt-5.5", rendered)
         self.assertIn("Cached Input", rendered)
         self.assertIn("1,240", rendered)
         self.assertIn("Total", rendered)
@@ -206,7 +343,16 @@ class CodexUsageTests(unittest.TestCase):
             start=datetime(2026, 6, 1, 0, 0, tzinfo=timezone.utc),
             end=datetime(2026, 6, 2, 0, 0, tzinfo=timezone.utc),
             group_by="day",
-            rows=[codex_usage.ReportRow(label="2026-06-01", usage=usage, sessions=1)],
+            rows=[
+                codex_usage.ReportRow(
+                    label="2026-06-01",
+                    usage=usage,
+                    sessions=1,
+                    models=("gpt-5.5",),
+                    efforts=("xhigh",),
+                    modes=("default",),
+                )
+            ],
             totals=usage,
             sessions_counted=1,
             files_counted=1,

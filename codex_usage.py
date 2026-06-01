@@ -19,6 +19,7 @@ TOKEN_KEYS = (
     "reasoning_output_tokens",
     "total_tokens",
 )
+UNKNOWN_METADATA = "unknown"
 
 GPT55_INPUT_USD_PER_1M = 5.00
 GPT55_CACHED_INPUT_USD_PER_1M = 0.50
@@ -75,11 +76,33 @@ class Usage:
 
 
 @dataclass(frozen=True)
+class TurnMetadata:
+    model: str = UNKNOWN_METADATA
+    effort: str = UNKNOWN_METADATA
+    mode: str = UNKNOWN_METADATA
+
+    @classmethod
+    def from_payload(cls, payload: dict | None) -> "TurnMetadata":
+        payload = payload or {}
+        collaboration_mode = payload.get("collaboration_mode") or {}
+        settings = collaboration_mode.get("settings") or {}
+
+        return cls(
+            model=metadata_value(payload.get("model") or settings.get("model")),
+            effort=metadata_value(
+                payload.get("effort") or settings.get("reasoning_effort")
+            ),
+            mode=metadata_value(collaboration_mode.get("mode")),
+        )
+
+
+@dataclass(frozen=True)
 class TokenEvent:
     timestamp: datetime
     usage: Usage
     session_id: str
     path: Path
+    metadata: TurnMetadata
 
 
 @dataclass(frozen=True)
@@ -87,6 +110,9 @@ class ReportRow:
     label: str
     usage: Usage
     sessions: int
+    models: tuple[str, ...] = ()
+    efforts: tuple[str, ...] = ()
+    modes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -137,11 +163,19 @@ def parse_timestamp(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
 
 
+def metadata_value(value) -> str:
+    if value is None:
+        return UNKNOWN_METADATA
+    value = str(value).strip()
+    return value or UNKNOWN_METADATA
+
+
 def iter_token_events(path: Path) -> Iterable[TokenEvent]:
     session_id = session_id_for_path(path)
+    metadata = TurnMetadata()
     with path.open("r", encoding="utf-8", errors="replace") as handle:
         for line in handle:
-            if '"token_count"' not in line:
+            if '"token_count"' not in line and '"turn_context"' not in line:
                 continue
             try:
                 record = json.loads(line)
@@ -149,6 +183,10 @@ def iter_token_events(path: Path) -> Iterable[TokenEvent]:
                 continue
 
             payload = record.get("payload") or {}
+            if record.get("type") == "turn_context":
+                metadata = TurnMetadata.from_payload(payload)
+                continue
+
             if record.get("type") != "event_msg" or payload.get("type") != "token_count":
                 continue
 
@@ -167,6 +205,7 @@ def iter_token_events(path: Path) -> Iterable[TokenEvent]:
                 usage=usage,
                 session_id=session_id,
                 path=path,
+                metadata=metadata,
             )
 
 
@@ -249,7 +288,13 @@ def resolve_timeframe(args: argparse.Namespace, now: datetime | None = None) -> 
     return start_utc, end_utc, label
 
 
-def group_label(timestamp: datetime, group_by: str, session_id: str, tzinfo) -> str:
+def group_label(
+    timestamp: datetime,
+    group_by: str,
+    session_id: str,
+    tzinfo,
+    metadata: TurnMetadata,
+) -> str:
     local = timestamp.astimezone(tzinfo)
     if group_by == "day":
         return local.date().isoformat()
@@ -260,7 +305,41 @@ def group_label(timestamp: datetime, group_by: str, session_id: str, tzinfo) -> 
         return f"{local.year:04d}-{local.month:02d}"
     if group_by == "session":
         return f"{local:%Y-%m-%d %H:%M} {session_id[:8]}"
+    if group_by == "model":
+        return metadata.model
+    if group_by == "effort":
+        return metadata.effort
+    if group_by == "mode":
+        return metadata.mode
+    if group_by == "model-effort":
+        return f"{metadata.model} · {metadata.effort}"
     raise ValueError(f"unknown group: {group_by}")
+
+
+def label_header(group_by: str) -> str:
+    return {
+        "day": "Date",
+        "week": "Week",
+        "month": "Month",
+        "session": "Session",
+        "model": "Model",
+        "effort": "Effort",
+        "mode": "Mode",
+        "model-effort": "Model / Effort",
+    }.get(group_by, "Group")
+
+
+def sorted_values(values: set[str]) -> tuple[str, ...]:
+    return tuple(sorted(values, key=lambda value: (value == UNKNOWN_METADATA, value)))
+
+
+def summarize_values(values: Iterable[str], limit: int = 3) -> str:
+    unique = [value for value in sorted_values(set(values)) if value]
+    if not unique:
+        return UNKNOWN_METADATA
+    if len(unique) <= limit:
+        return ", ".join(unique)
+    return ", ".join(unique[:limit]) + f", +{len(unique) - limit}"
 
 
 def build_report(
@@ -278,6 +357,9 @@ def build_report(
     files = discover_rollout_files(roots)
     grouped: dict[str, Usage] = {}
     grouped_sessions: dict[str, set[str]] = {}
+    grouped_models: dict[str, set[str]] = {}
+    grouped_efforts: dict[str, set[str]] = {}
+    grouped_modes: dict[str, set[str]] = {}
     session_labels: dict[str, str] = {}
     sessions_with_usage: set[str] = set()
     files_counted = 0
@@ -305,12 +387,27 @@ def build_report(
                 label = event.session_id
                 session_labels.setdefault(
                     event.session_id,
-                    group_label(event.timestamp, group_by, event.session_id, tzinfo),
+                    group_label(
+                        event.timestamp,
+                        group_by,
+                        event.session_id,
+                        tzinfo,
+                        event.metadata,
+                    ),
                 )
             else:
-                label = group_label(event.timestamp, group_by, event.session_id, tzinfo)
+                label = group_label(
+                    event.timestamp,
+                    group_by,
+                    event.session_id,
+                    tzinfo,
+                    event.metadata,
+                )
             grouped[label] = grouped.get(label, Usage()) + delta
             grouped_sessions.setdefault(label, set()).add(event.session_id)
+            grouped_models.setdefault(label, set()).add(event.metadata.model)
+            grouped_efforts.setdefault(label, set()).add(event.metadata.effort)
+            grouped_modes.setdefault(label, set()).add(event.metadata.mode)
             sessions_with_usage.add(event.session_id)
             events_counted += 1
             file_had_window_usage = True
@@ -323,6 +420,9 @@ def build_report(
             label=session_labels.get(label, label),
             usage=usage,
             sessions=len(grouped_sessions.get(label, set())),
+            models=sorted_values(grouped_models.get(label, set())),
+            efforts=sorted_values(grouped_efforts.get(label, set())),
+            modes=sorted_values(grouped_modes.get(label, set())),
         )
         for label, usage in grouped.items()
     ]
@@ -415,8 +515,11 @@ def render_report(report: Report, color: bool = True, limit: int | None = None) 
     muted = "2"
 
     headers = [
-        ansi("Date" if report.group_by != "session" else "Session", cyan, color),
+        ansi(label_header(report.group_by), cyan, color),
         ansi("Sessions", cyan, color),
+        ansi("Models", cyan, color),
+        ansi("Efforts", cyan, color),
+        ansi("Modes", cyan, color),
         ansi("Input", cyan, color),
         ansi("Cached Input", cyan, color),
         ansi("Uncached", cyan, color),
@@ -432,6 +535,9 @@ def render_report(report: Report, color: bool = True, limit: int | None = None) 
             [
                 row.label,
                 comma(row.sessions),
+                summarize_values(row.models),
+                summarize_values(row.efforts),
+                summarize_values(row.modes),
                 comma(row.usage.input_tokens),
                 comma(row.usage.cached_input_tokens),
                 comma(row.usage.uncached_input_tokens),
@@ -444,10 +550,16 @@ def render_report(report: Report, color: bool = True, limit: int | None = None) 
 
     total_label = ansi("Total", yellow, color)
     total = report.totals
+    all_models = [model for row in rows for model in row.models]
+    all_efforts = [effort for row in rows for effort in row.efforts]
+    all_modes = [mode for row in rows for mode in row.modes]
     body.append(
         [
             total_label,
             ansi(comma(report.sessions_counted), yellow, color),
+            ansi(summarize_values(all_models), yellow, color),
+            ansi(summarize_values(all_efforts), yellow, color),
+            ansi(summarize_values(all_modes), yellow, color),
             ansi(comma(total.input_tokens), yellow, color),
             ansi(comma(total.cached_input_tokens), yellow, color),
             ansi(comma(total.uncached_input_tokens), yellow, color),
@@ -458,7 +570,20 @@ def render_report(report: Report, color: bool = True, limit: int | None = None) 
         ]
     )
 
-    aligns = ["left", "right", "right", "right", "right", "right", "right", "right", "right"]
+    aligns = [
+        "left",
+        "right",
+        "left",
+        "left",
+        "left",
+        "right",
+        "right",
+        "right",
+        "right",
+        "right",
+        "right",
+        "right",
+    ]
     table = make_table(headers, body, aligns)
     local_tz = datetime.now().astimezone().tzinfo
     subtitle = (
@@ -492,6 +617,9 @@ def render_report(report: Report, color: bool = True, limit: int | None = None) 
 
 
 def report_to_json(report: Report) -> dict:
+    all_models = [model for row in report.rows for model in row.models]
+    all_efforts = [effort for row in report.rows for effort in row.efforts]
+    all_modes = [mode for row in report.rows for mode in row.modes]
     return {
         "title": report.title,
         "start": report.start.isoformat(),
@@ -504,11 +632,17 @@ def report_to_json(report: Report) -> dict:
             **report.totals.as_dict(),
             "uncached_input_tokens": report.totals.uncached_input_tokens,
             "estimated_cost_usd": estimate_cost_usd(report.totals),
+            "models": list(sorted_values(set(all_models))),
+            "efforts": list(sorted_values(set(all_efforts))),
+            "modes": list(sorted_values(set(all_modes))),
         },
         "rows": [
             {
                 "label": row.label,
                 "sessions": row.sessions,
+                "models": list(row.models),
+                "efforts": list(row.efforts),
+                "modes": list(row.modes),
                 **row.usage.as_dict(),
                 "uncached_input_tokens": row.usage.uncached_input_tokens,
                 "estimated_cost_usd": estimate_cost_usd(row.usage),
@@ -541,7 +675,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--until", help="end date, inclusive, local time, YYYY-MM-DD")
     parser.add_argument(
         "--group-by",
-        choices=("day", "week", "month", "session"),
+        choices=("day", "week", "month", "session", "model", "effort", "mode", "model-effort"),
         default="day",
         help="aggregation level (default: day)",
     )
