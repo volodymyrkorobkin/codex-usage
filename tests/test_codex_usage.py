@@ -64,6 +64,12 @@ class CodexUsageTests(unittest.TestCase):
         self.assertEqual(label, "Last 30d")
         self.assertEqual(end - start, codex_usage.parse_duration("30d"))
 
+    def test_metadata_wrapping_does_not_start_lines_with_commas(self) -> None:
+        self.assertEqual(
+            codex_usage.wrap_metadata_text("default, plan, unknown", 7),
+            ["default", "plan", "unknown"],
+        )
+
     def test_rollup_uses_cumulative_delta_within_window(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / "rollout-2026-06-01T00-00-00-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl"
@@ -318,7 +324,12 @@ class CodexUsageTests(unittest.TestCase):
             events_counted=1,
         )
 
-        rendered = codex_usage.render_report(report, color=False)
+        rendered = codex_usage.render_report(
+            report,
+            color=False,
+            terminal_width=180,
+            table_mode="full",
+        )
 
         self.assertIn("Codex Token Usage Report - Daily", rendered)
         self.assertIn("Date", rendered)
@@ -372,10 +383,99 @@ class CodexUsageTests(unittest.TestCase):
             events_counted=1,
         )
 
-        rendered = codex_usage.render_report(report, color=False)
+        rendered = codex_usage.render_report(
+            report,
+            color=False,
+            terminal_width=180,
+            table_mode="full",
+        )
 
         self.assertIn("Cost (USD)", rendered)
         self.assertIn("$35.00", rendered)
+
+    def test_auto_table_fits_requested_terminal_width(self) -> None:
+        usage = codex_usage.Usage(
+            input_tokens=1_765_756_172,
+            cached_input_tokens=1_679_256_448,
+            output_tokens=6_457_884,
+            reasoning_output_tokens=2_163_395,
+            total_tokens=1_773_627_014,
+        )
+        report = codex_usage.Report(
+            title="Codex Token Usage Report - Daily",
+            start=datetime(2026, 5, 3, 0, 0, tzinfo=timezone.utc),
+            end=datetime(2026, 6, 3, 0, 0, tzinfo=timezone.utc),
+            group_by="day",
+            rows=[
+                codex_usage.ReportRow(
+                    label="2026-06-02",
+                    usage=usage,
+                    sessions=185,
+                    models=("codex-auto-review", "gpt-5.5", "unknown"),
+                    efforts=("high", "low", "medium", "xhigh", "unknown"),
+                    modes=("default", "plan", "unknown"),
+                )
+            ],
+            totals=usage,
+            sessions_counted=185,
+            files_counted=1,
+            events_counted=1,
+        )
+
+        rendered = codex_usage.render_report(
+            report,
+            color=False,
+            terminal_width=80,
+            table_mode="auto",
+        )
+
+        self.assertTrue(
+            all(codex_usage.visible_len(line) <= 80 for line in rendered.splitlines()),
+            rendered,
+        )
+        self.assertIn("codex-", rendered)
+        self.assertIn("xhigh", rendered)
+        self.assertIn("Cost", rendered)
+
+    def test_full_table_can_be_forced_for_wide_output(self) -> None:
+        usage = codex_usage.Usage(
+            input_tokens=1_000_000,
+            cached_input_tokens=500_000,
+            output_tokens=25_000,
+            reasoning_output_tokens=10_000,
+            total_tokens=1_025_000,
+        )
+        report = codex_usage.Report(
+            title="Codex Token Usage Report - Daily",
+            start=datetime(2026, 6, 1, 0, 0, tzinfo=timezone.utc),
+            end=datetime(2026, 6, 2, 0, 0, tzinfo=timezone.utc),
+            group_by="day",
+            rows=[
+                codex_usage.ReportRow(
+                    label="2026-06-01",
+                    usage=usage,
+                    sessions=1,
+                    models=("gpt-5.5",),
+                    efforts=("xhigh",),
+                    modes=("default",),
+                )
+            ],
+            totals=usage,
+            sessions_counted=1,
+            files_counted=1,
+            events_counted=1,
+        )
+
+        rendered = codex_usage.render_report(
+            report,
+            color=False,
+            terminal_width=180,
+            table_mode="full",
+        )
+
+        self.assertIn("Cached Input", rendered)
+        self.assertIn("Uncached", rendered)
+        self.assertIn("Reasoning", rendered)
 
 
 if __name__ == "__main__":

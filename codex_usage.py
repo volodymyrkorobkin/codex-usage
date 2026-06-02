@@ -5,7 +5,9 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
+import textwrap
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -126,6 +128,15 @@ class Report:
     sessions_counted: int
     files_counted: int
     events_counted: int
+
+
+@dataclass(frozen=True)
+class TableColumn:
+    key: str
+    header: str
+    align: str
+    wrap: bool = False
+    min_width: int | None = None
 
 
 def default_roots(codex_home: Path | None = None) -> list[Path]:
@@ -333,7 +344,7 @@ def sorted_values(values: set[str]) -> tuple[str, ...]:
     return tuple(sorted(values, key=lambda value: (value == UNKNOWN_METADATA, value)))
 
 
-def summarize_values(values: Iterable[str], limit: int = 3) -> str:
+def summarize_values(values: Iterable[str], limit: int = 5) -> str:
     unique = [value for value in sorted_values(set(values)) if value]
     if not unique:
         return UNKNOWN_METADATA
@@ -483,108 +494,286 @@ def pad(text: str, width: int, align: str = "left") -> str:
     return text + " " * padding
 
 
-def make_table(headers: list[str], rows: list[list[str]], aligns: list[str]) -> str:
+def detect_terminal_width() -> int:
+    return shutil.get_terminal_size(fallback=(120, 24)).columns
+
+
+def wrap_text(text: str, width: int, break_long_words: bool = True) -> list[str]:
+    if width <= 0:
+        return [text]
+    lines: list[str] = []
+    for part in str(text).splitlines() or [""]:
+        wrapped = textwrap.wrap(
+            part,
+            width=width,
+            break_long_words=break_long_words,
+            break_on_hyphens=True,
+        )
+        lines.extend(wrapped or [""])
+    return lines
+
+
+def wrap_metadata_text(text: str, width: int) -> list[str]:
+    parts = [part.strip() for part in str(text).split(", ")]
+    if len(parts) == 1:
+        return wrap_text(text, width)
+
+    lines: list[str] = []
+    current = ""
+    for part in parts:
+        candidate = part if not current else f"{current}, {part}"
+        if not current or visible_len(candidate) <= width:
+            current = candidate
+            continue
+        lines.extend(wrap_text(current, width))
+        current = part
+    if current:
+        lines.extend(wrap_text(current, width))
+    return lines or [""]
+
+
+def table_width(widths: list[int]) -> int:
+    return sum(widths) + (3 * len(widths)) + 1
+
+
+def fit_widths(
+    widths: list[int],
+    max_width: int | None,
+    wrap_columns: set[int],
+    min_widths: list[int],
+) -> list[int]:
+    if not max_width:
+        return widths
+
+    fitted = widths[:]
+    while table_width(fitted) > max_width:
+        candidates = [
+            index
+            for index in wrap_columns
+            if fitted[index] > min_widths[index]
+        ]
+        if not candidates:
+            break
+        widest = max(candidates, key=lambda index: fitted[index])
+        fitted[widest] -= 1
+    return fitted
+
+
+def make_table(
+    headers: list[str],
+    rows: list[list[str]],
+    aligns: list[str],
+    max_width: int | None = None,
+    wrap_columns: set[int] | None = None,
+    min_widths: list[int] | None = None,
+    color: bool = True,
+    header_style: str | None = None,
+    total_style: str | None = None,
+) -> str:
+    wrap_columns = wrap_columns or set()
     widths = [
         max(visible_len(headers[i]), *(visible_len(row[i]) for row in rows))
         for i in range(len(headers))
     ]
+    min_widths = min_widths or [visible_len(headers[i]) for i in range(len(headers))]
+    widths = fit_widths(widths, max_width, wrap_columns, min_widths)
 
     def border(left: str, middle: str, right: str) -> str:
         return left + middle.join("─" * (width + 2) for width in widths) + right
 
-    def line(values: list[str]) -> str:
-        cells = [
-            " " + pad(value, widths[i], aligns[i]) + " "
-            for i, value in enumerate(values)
-        ]
-        return "│" + "│".join(cells) + "│"
+    def cell_lines(value: str, index: int) -> list[str]:
+        if index not in wrap_columns:
+            return str(value).splitlines() or [""]
+        return wrap_metadata_text(str(value), widths[index])
 
-    output = [border("┌", "┬", "┐"), line(headers), border("├", "┼", "┤")]
+    def line(values: list[str], style: str | None = None) -> list[str]:
+        expanded = [cell_lines(value, index) for index, value in enumerate(values)]
+        height = max(len(value_lines) for value_lines in expanded)
+        output: list[str] = []
+        for line_index in range(height):
+            row_values = [
+                value_lines[line_index] if line_index < len(value_lines) else ""
+                for value_lines in expanded
+            ]
+            cells = [
+                " " + pad(value, widths[i], aligns[i]) + " "
+                for i, value in enumerate(row_values)
+            ]
+            if style:
+                cells = [ansi(cell, style, color) for cell in cells]
+            output.append("│" + "│".join(cells) + "│")
+        return output
+
+    output = [border("┌", "┬", "┐")]
+    output.extend(line(headers, header_style))
+    output.append(border("├", "┼", "┤"))
     for index, row in enumerate(rows):
-        output.append(line(row))
+        style = total_style if index == len(rows) - 1 else None
+        output.extend(line(row, style))
         if index != len(rows) - 1:
             output.append(border("├", "┼", "┤"))
     output.append(border("└", "┴", "┘"))
     return "\n".join(output)
 
 
-def render_report(report: Report, color: bool = True, limit: int | None = None) -> str:
-    rows = report.rows[:limit] if limit else report.rows
-    cyan = "96"
-    yellow = "93"
-    muted = "2"
-
-    headers = [
-        ansi(label_header(report.group_by), cyan, color),
-        ansi("Sessions", cyan, color),
-        ansi("Models", cyan, color),
-        ansi("Efforts", cyan, color),
-        ansi("Modes", cyan, color),
-        ansi("Input", cyan, color),
-        ansi("Cached Input", cyan, color),
-        ansi("Uncached", cyan, color),
-        ansi("Output", cyan, color),
-        ansi("Reasoning", cyan, color),
-        ansi("Total Tokens", cyan, color),
-        ansi("Cost (USD)", cyan, color),
+def table_columns(report: Report, table_mode: str) -> list[TableColumn]:
+    sessions_header = "Sess" if table_mode == "compact" else "Sessions"
+    common = [
+        TableColumn("label", label_header(report.group_by), "left"),
+        TableColumn("sessions", sessions_header, "right"),
+        TableColumn("models", "Models", "left", wrap=True, min_width=8),
+        TableColumn("efforts", "Efforts", "left", wrap=True, min_width=7),
+        TableColumn("modes", "Modes", "left", wrap=True, min_width=7),
+    ]
+    if table_mode == "compact":
+        return common + [
+            TableColumn("total", "Total", "right"),
+            TableColumn("cost", "Cost", "right"),
+        ]
+    return common + [
+        TableColumn("input", "Input", "right"),
+        TableColumn("cached_input", "Cached Input", "right"),
+        TableColumn("uncached", "Uncached", "right"),
+        TableColumn("output", "Output", "right"),
+        TableColumn("reasoning", "Reasoning", "right"),
+        TableColumn("total", "Total Tokens", "right"),
+        TableColumn("cost", "Cost (USD)", "right"),
     ]
 
-    body: list[list[str]] = []
-    for row in rows:
-        body.append(
-            [
-                row.label,
-                comma(row.sessions),
-                summarize_values(row.models),
-                summarize_values(row.efforts),
-                summarize_values(row.modes),
-                comma(row.usage.input_tokens),
-                comma(row.usage.cached_input_tokens),
-                comma(row.usage.uncached_input_tokens),
-                comma(row.usage.output_tokens),
-                comma(row.usage.reasoning_output_tokens),
-                comma(row.usage.total_tokens),
-                dollars(estimate_cost_usd(row.usage)),
-            ]
-        )
 
-    total_label = ansi("Total", yellow, color)
-    total = report.totals
+def value_for_column(key: str, row: ReportRow) -> str:
+    values = {
+        "label": row.label,
+        "sessions": comma(row.sessions),
+        "models": summarize_values(row.models),
+        "efforts": summarize_values(row.efforts),
+        "modes": summarize_values(row.modes),
+        "input": comma(row.usage.input_tokens),
+        "cached_input": comma(row.usage.cached_input_tokens),
+        "uncached": comma(row.usage.uncached_input_tokens),
+        "output": comma(row.usage.output_tokens),
+        "reasoning": comma(row.usage.reasoning_output_tokens),
+        "total": comma(row.usage.total_tokens),
+        "cost": dollars(estimate_cost_usd(row.usage)),
+    }
+    return values[key]
+
+
+def total_row_for_columns(
+    columns: list[TableColumn],
+    rows: list[ReportRow],
+    report: Report,
+) -> list[str]:
     all_models = [model for row in rows for model in row.models]
     all_efforts = [effort for row in rows for effort in row.efforts]
     all_modes = [mode for row in rows for mode in row.modes]
-    body.append(
-        [
-            total_label,
-            ansi(comma(report.sessions_counted), yellow, color),
-            ansi(summarize_values(all_models), yellow, color),
-            ansi(summarize_values(all_efforts), yellow, color),
-            ansi(summarize_values(all_modes), yellow, color),
-            ansi(comma(total.input_tokens), yellow, color),
-            ansi(comma(total.cached_input_tokens), yellow, color),
-            ansi(comma(total.uncached_input_tokens), yellow, color),
-            ansi(comma(total.output_tokens), yellow, color),
-            ansi(comma(total.reasoning_output_tokens), yellow, color),
-            ansi(comma(total.total_tokens), yellow, color),
-            ansi(dollars(estimate_cost_usd(total)), yellow, color),
-        ]
+    total = report.totals
+    values = {
+        "label": "Total",
+        "sessions": comma(report.sessions_counted),
+        "models": summarize_values(all_models),
+        "efforts": summarize_values(all_efforts),
+        "modes": summarize_values(all_modes),
+        "input": comma(total.input_tokens),
+        "cached_input": comma(total.cached_input_tokens),
+        "uncached": comma(total.uncached_input_tokens),
+        "output": comma(total.output_tokens),
+        "reasoning": comma(total.reasoning_output_tokens),
+        "total": comma(total.total_tokens),
+        "cost": dollars(estimate_cost_usd(total)),
+    }
+    return [values[column.key] for column in columns]
+
+
+def render_table_for_mode(
+    report: Report,
+    rows: list[ReportRow],
+    table_mode: str,
+    color: bool,
+    max_width: int | None,
+) -> str:
+    columns = table_columns(report, table_mode)
+    headers = [column.header for column in columns]
+    body = [
+        [value_for_column(column.key, row) for column in columns]
+        for row in rows
+    ]
+    body.append(total_row_for_columns(columns, rows, report))
+    aligns = [column.align for column in columns]
+    wrap_columns = {index for index, column in enumerate(columns) if column.wrap}
+    min_widths = [
+        column.min_width or visible_len(column.header)
+        for column in columns
+    ]
+    return make_table(
+        headers,
+        body,
+        aligns,
+        max_width=max_width,
+        wrap_columns=wrap_columns,
+        min_widths=min_widths,
+        color=color,
+        header_style="96",
+        total_style="93",
     )
 
-    aligns = [
-        "left",
-        "right",
-        "left",
-        "left",
-        "left",
-        "right",
-        "right",
-        "right",
-        "right",
-        "right",
-        "right",
-        "right",
+
+def render_usage_table(
+    report: Report,
+    rows: list[ReportRow],
+    table_mode: str,
+    color: bool,
+    max_width: int,
+) -> str:
+    if table_mode == "auto":
+        full_table = render_table_for_mode(report, rows, "full", color, max_width)
+        if all(visible_len(line) <= max_width for line in full_table.splitlines()):
+            return full_table
+        return render_table_for_mode(report, rows, "compact", color, max_width)
+    return render_table_for_mode(report, rows, table_mode, color, max_width)
+
+
+def make_title_box(
+    title: str,
+    subtitle: str,
+    meta: str,
+    cost_note: str,
+    color: bool,
+    max_width: int,
+) -> str:
+    items = [
+        (title, None),
+        (subtitle, "2"),
+        (meta, "2"),
+        (cost_note, "2"),
     ]
-    table = make_table(headers, body, aligns)
+    content_width = max(
+        20,
+        min(max(visible_len(text) for text, _ in items), max_width - 4),
+    )
+    wrapped: list[tuple[str, str | None]] = []
+    for text, style in items:
+        wrapped.extend((line, style) for line in wrap_text(text, content_width))
+    box_width = max(visible_len(line) for line, _ in wrapped) + 4
+
+    output = ["┌" + "─" * box_width + "┐"]
+    for text, style in wrapped:
+        value = ansi(text, style, color) if style else text
+        output.append("│ " + pad(value, box_width - 2, "center") + " │")
+    output.append("└" + "─" * box_width + "┘")
+    return "\n".join(output)
+
+
+def render_report(
+    report: Report,
+    color: bool = True,
+    limit: int | None = None,
+    terminal_width: int | None = None,
+    table_mode: str = "auto",
+) -> str:
+    rows = report.rows[:limit] if limit else report.rows
+    width = terminal_width or detect_terminal_width()
+    table = render_usage_table(report, rows, table_mode, color, width)
     local_tz = datetime.now().astimezone().tzinfo
     subtitle = (
         f"{report.start.astimezone(local_tz):%Y-%m-%d %H:%M} -> "
@@ -595,21 +784,13 @@ def render_report(report: Report, color: bool = True, limit: int | None = None) 
         f"{report.files_counted} rollout files"
     )
     cost_note = PRICING_LABEL + "; reasoning is included in output"
-    box_width = max(
-        visible_len(report.title),
-        visible_len(subtitle),
-        visible_len(meta),
-        visible_len(cost_note),
-    ) + 4
-    title_box = "\n".join(
-        [
-            "┌" + "─" * box_width + "┐",
-            "│ " + pad(report.title, box_width - 2, "center") + " │",
-            "│ " + pad(ansi(subtitle, muted, color), box_width - 2, "center") + " │",
-            "│ " + pad(ansi(meta, muted, color), box_width - 2, "center") + " │",
-            "│ " + pad(ansi(cost_note, muted, color), box_width - 2, "center") + " │",
-            "└" + "─" * box_width + "┘",
-        ]
+    title_box = make_title_box(
+        report.title,
+        subtitle,
+        meta,
+        cost_note,
+        color,
+        width,
     )
     if not report.rows:
         return f"{title_box}\n\nNo token usage found for this timeframe."
@@ -683,6 +864,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--codex-home", type=Path, default=Path.home() / ".codex")
     parser.add_argument("--json", action="store_true", help="emit JSON instead of a table")
     parser.add_argument(
+        "--table",
+        choices=("auto", "full", "compact"),
+        default="auto",
+        help="table layout mode (default: auto)",
+    )
+    parser.add_argument("--width", type=int, help="override detected terminal width")
+    parser.add_argument(
         "--color",
         choices=("auto", "always", "never"),
         default="auto",
@@ -713,7 +901,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     color = args.color == "always" or (args.color == "auto" and sys.stdout.isatty() and os.environ.get("NO_COLOR") is None)
-    print(render_report(report, color=color, limit=args.limit))
+    print(
+        render_report(
+            report,
+            color=color,
+            limit=args.limit,
+            terminal_width=args.width,
+            table_mode=args.table,
+        )
+    )
     return 0
 
 

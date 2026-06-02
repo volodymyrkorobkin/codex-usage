@@ -13,6 +13,7 @@ It runs entirely locally. It does not call external APIs.
 - Daily, weekly, monthly, and per-session reports.
 - Model, reasoning effort, and collaboration mode attribution when present in
   Codex `turn_context` events.
+- Terminal-width-aware tables with multiline model, effort, and mode cells.
 - Rolling windows such as `24h`, `7d`, `30d`, `2w`, and `3m`.
 - Explicit date ranges with `--since` and `--until`.
 - JSON output for scripting.
@@ -97,6 +98,15 @@ codex-usage --last 7d --group-by model-effort
 # JSON output
 codex-usage --last 7d --json
 
+# Force every token column, even on narrower terminals
+codex-usage --table full
+
+# Force the narrower summary table
+codex-usage --table compact
+
+# Test or screenshot a specific width
+codex-usage --width 100
+
 # Use a custom Codex home
 codex-usage --codex-home /path/to/.codex
 ```
@@ -105,6 +115,10 @@ Supported duration units for `--last`: `h`, `d`, `w`, `m`.
 Examples: `24h`, `7d`, `30d`, `2w`, `3m`.
 
 ## Output Columns
+
+The default `--table auto` mode detects the terminal width. It uses the full
+table when it fits and falls back to a compact table when needed. `Models`,
+`Efforts`, and `Modes` can wrap across multiple lines inside a row.
 
 - `Models`: model names from the most recent `turn_context` before each token
   event, such as `gpt-5.5`.
