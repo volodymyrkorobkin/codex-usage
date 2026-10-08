@@ -558,6 +558,47 @@ class PricingTests(unittest.TestCase):
         self.assertIsNone(report.estimated_cost_usd)
         self.assertIsNone(codex_usage.report_to_json(report)['rows'][0]['estimated_cost_usd'])
 
+    def test_auto_review_does_not_hide_priced_daily_usage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / 'rollout-review-fixture.jsonl'
+            log.write_text('\n'.join([
+                turn_context('2026-10-01T01:00:00Z', 'gpt-6-sol'),
+                token_event('2026-10-01T01:01:00Z', dict(input_tokens=100000, total_tokens=100000)),
+                turn_context('2026-10-01T02:00:00Z', 'codex-auto-review', effort='low'),
+                token_event('2026-10-01T02:01:00Z', dict(input_tokens=101000, total_tokens=101000),
+                            dict(input_tokens=1000, total_tokens=1000)),
+            ]))
+            reports = [codex_usage.build_report([Path(tmp)], self.stamp, self.stamp + timedelta(days=1),
+                                               group_by=group, pricing=codex_pricing.Pricing(self.data))
+                       for group in ('day', 'model')]
+        daily, models = reports
+        self.assertEqual(daily.totals.input_tokens, 101000)
+        self.assertEqual(daily.unpriced_events, 1)
+        self.assertEqual(daily.priced_events, 1)
+        self.assertIsNone(daily.estimated_cost_usd)
+        self.assertAlmostEqual(daily.known_cost_usd, 0.2)
+        self.assertEqual(codex_usage.display_cost(daily.rows[0]), '$0.20*')
+        for mode in ('full', 'compact', 'auto'):
+            rendered = codex_usage.render_report(daily, color=False, table_mode=mode)
+            self.assertIn('$0.20*', rendered)
+            self.assertIn('Partial cost', rendered)
+        rows = {row.label: row for row in models.rows}
+        self.assertEqual(codex_usage.display_cost(rows['codex-auto-review']), 'N/A')
+        self.assertEqual(codex_usage.display_cost(rows['gpt-6-sol']), '$0.20')
+        self.assertIn('$0.20*', codex_usage.render_report(models, color=False, limit=1))
+        data = codex_usage.report_to_json(daily)
+        self.assertEqual(data['rows'][0]['known_cost_usd'], 0.2)
+        self.assertEqual(data['totals']['known_cost_usd'], 0.2)
+        self.assertEqual(data['totals']['priced_events'], 1)
+        self.assertIsNone(data['totals']['estimated_cost_usd'])
+
+    def test_zero_priced_subtotal_is_distinct_from_no_priced_events(self):
+        row = codex_usage.ReportRow('mixed', codex_usage.Usage(), 1,
+                                    priced_events=1, unpriced_events=1)
+        self.assertEqual(codex_usage.display_cost(row), '$0.00*')
+        unknown = codex_usage.ReportRow('unknown', codex_usage.Usage(), 1, unpriced_events=1)
+        self.assertEqual(codex_usage.display_cost(unknown), 'N/A')
+
     def test_catalog_validation_rejects_overlaps_invalid_rates_and_dates(self):
         for mutation in ('overlap', 'negative', 'naive'):
             data = json.loads(json.dumps(self.data))

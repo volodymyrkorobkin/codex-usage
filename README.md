@@ -199,13 +199,23 @@ published model price and explicitly labels that fallback. `--strict-pricing-his
 disables that fallback. It does not turn observation dates into verified dates.
 
 Models without an exact published price, unsupported cache/context rates, or
-uncovered dates in strict mode show `N/A` (`null` in JSON). If any event in a row
-is unpriced, that row and the overall total are unavailable; partial costs are
-never presented as a complete total. Token counts remain available.
+uncovered dates in strict mode have no estimated price. Mixed rows and the total
+still show the cost of priced events with an asterisk, such as `$12.34*`. The
+asterisk means **partial cost: unpriced events are excluded**. A row with no priced
+events shows `N/A`. All events remain included in token counts.
+
+`codex-auto-review` is a reviewer label found in Codex logs. Codex Auto-review
+checks eligible tool approval requests (see the
+[official documentation](https://learn.chatgpt.com/docs/cyber-safety/recommended-configuration)).
+The pricing source does not give this label an API rate, so the tool keeps its
+usage visible and unpriced rather than assigning another model's rate.
 
 JSON output includes `pricing.rates` with the model, tier, source, recorded
 start/end, date basis, and rates actually selected, plus pricing notes and
-`unpriced_events` in rows and totals.
+`unpriced_events` in rows and totals. `known_cost_usd` contains the priced
+subtotal and `priced_events` counts the events contributing to it.
+`estimated_cost_usd` remains `null` when any events are unpriced, so scripts can
+distinguish a complete estimate from a partial subtotal.
 
 A supplied `--pricing-file` uses the same schema. For independently verified
 historical periods, use `date_basis: "effective"` and cite the evidence in

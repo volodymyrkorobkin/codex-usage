@@ -113,6 +113,8 @@ class ReportRow:
     modes: tuple[str, ...] = ()
     estimated_cost_usd: float | None = None
     unpriced_events: int = 0
+    known_cost_usd: float = 0.0
+    priced_events: int = 0
 
 
 @dataclass(frozen=True)
@@ -128,6 +130,8 @@ class Report:
     events_counted: int
     estimated_cost_usd: float | None = None
     unpriced_events: int = 0
+    known_cost_usd: float = 0.0
+    priced_events: int = 0
     pricing: dict = field(default_factory=dict)
 
 
@@ -375,6 +379,7 @@ def build_report(
     pricing = pricing or Pricing(bundled_catalog())
     grouped_costs: dict[str, float] = {}
     grouped_unpriced: dict[str, int] = {}
+    grouped_priced: dict[str, int] = {}
     files = discover_rollout_files(roots)
     grouped: dict[str, Usage] = {}
     grouped_sessions: dict[str, set[str]] = {}
@@ -434,6 +439,7 @@ def build_report(
                 grouped_unpriced[label] = grouped_unpriced.get(label, 0) + 1
             else:
                 grouped_costs[label] = grouped_costs.get(label, 0.0) + cost
+                grouped_priced[label] = grouped_priced.get(label, 0) + 1
             grouped[label] = grouped.get(label, Usage()) + delta
             grouped_sessions.setdefault(label, set()).add(event.session_id)
             grouped_models.setdefault(label, set()).add(event.metadata.model)
@@ -456,6 +462,8 @@ def build_report(
             modes=sorted_values(grouped_modes.get(label, set())),
             estimated_cost_usd=(None if grouped_unpriced.get(label) else grouped_costs.get(label, 0.0)),
             unpriced_events=grouped_unpriced.get(label, 0),
+            known_cost_usd=grouped_costs.get(label, 0.0),
+            priced_events=grouped_priced.get(label, 0),
         )
         for label, usage in grouped.items()
     ]
@@ -480,6 +488,8 @@ def build_report(
         events_counted=events_counted,
         estimated_cost_usd=(None if grouped_unpriced else sum(grouped_costs.values())),
         unpriced_events=sum(grouped_unpriced.values()),
+        known_cost_usd=sum(grouped_costs.values()),
+        priced_events=sum(grouped_priced.values()),
         pricing=pricing.as_dict(),
     )
 
@@ -490,6 +500,14 @@ def comma(value: int) -> str:
 
 def dollars(value: float | None) -> str:
     return "N/A" if value is None else f"${value:,.2f}"
+
+
+def display_cost(row: ReportRow | Report) -> str:
+    if row.estimated_cost_usd is not None:
+        return dollars(row.estimated_cost_usd)
+    if row.priced_events:
+        return dollars(row.known_cost_usd) + "*"
+    return "N/A"
 
 
 def ansi(text: str, code: str, enabled: bool) -> str:
@@ -671,7 +689,7 @@ def value_for_column(key: str, row: ReportRow) -> str:
         "output": comma(row.usage.output_tokens),
         "reasoning": comma(row.usage.reasoning_output_tokens),
         "total": comma(row.usage.total_tokens),
-        "cost": dollars(row.estimated_cost_usd),
+        "cost": display_cost(row),
     }
     return values[key]
 
@@ -697,7 +715,7 @@ def total_row_for_columns(
         "output": comma(total.output_tokens),
         "reasoning": comma(total.reasoning_output_tokens),
         "total": comma(total.total_tokens),
-        "cost": dollars(report.estimated_cost_usd),
+        "cost": display_cost(report),
     }
     return [values[column.key] for column in columns]
 
@@ -808,7 +826,7 @@ def render_report(
     if notes:
         cost_note += ". " + "; ".join(notes)
     if report.unpriced_events:
-        cost_note += f". N/A: {report.unpriced_events} events lack applicable prices"
+        cost_note += f". * Partial cost: excludes {report.unpriced_events} unpriced events; N/A means no priced events"
     cost_note += ". API-equivalent cost, not a ChatGPT bill"
     title_box = make_title_box(
         report.title,
@@ -840,6 +858,8 @@ def report_to_json(report: Report) -> dict:
             "uncached_input_tokens": report.totals.uncached_input_tokens,
             "estimated_cost_usd": report.estimated_cost_usd,
             "unpriced_events": report.unpriced_events,
+            "known_cost_usd": report.known_cost_usd,
+            "priced_events": report.priced_events,
             "models": list(sorted_values(set(all_models))),
             "efforts": list(sorted_values(set(all_efforts))),
             "modes": list(sorted_values(set(all_modes))),
@@ -855,6 +875,8 @@ def report_to_json(report: Report) -> dict:
                 "uncached_input_tokens": row.usage.uncached_input_tokens,
                 "estimated_cost_usd": row.estimated_cost_usd,
                 "unpriced_events": row.unpriced_events,
+                "known_cost_usd": row.known_cost_usd,
+                "priced_events": row.priced_events,
             }
             for row in report.rows
         ],
