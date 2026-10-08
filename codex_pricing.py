@@ -167,35 +167,75 @@ class Pricing:
         self.strict_history = strict_history
         self.used: dict[str, dict] = {}
         self.notes: set[str] = set()
+        self.fallback_models: dict[str, dict] = {}
 
-    def cost(self, usage, model: str, timestamp: datetime, request_input: int | None) -> float | None:
+    def _price_at(self, model: str, timestamp: datetime):
         candidates = [p for p in self.data['prices'] if p['model'] == model and p['tier'] == self.tier]
         matched = [p for p in candidates if utc(p['start']) <= timestamp and
                    (p['end'] is None or timestamp < utc(p['end']))]
         if matched:
-            price = matched[0]
+            return matched[0], False
         elif candidates and not self.strict_history and timestamp < min(utc(p['start']) for p in candidates):
-            price = max(candidates, key=lambda p: utc(p['start']))
-            self.notes.add('Current published rates used before recorded history')
-        else:
+            return max(candidates, key=lambda p: utc(p['start'])), True
+        return None, False
+
+    @staticmethod
+    def _amount(usage, price, request_input):
+        prefix = 'long_' if request_input is not None and request_input > price['long_context_threshold'] else ''
+        rates = price['rates']
+        input_rate, cached_rate, output_rate = (rates[prefix + key] for key in ('input', 'cached_input', 'output'))
+        if input_rate is None or output_rate is None or (cached_rate is None and usage.cached_input_tokens):
+            return None
+        return (usage.uncached_input_tokens * input_rate + usage.cached_input_tokens * (cached_rate or 0) + usage.output_tokens * output_rate) / 1_000_000
+
+    def cost(self, usage, model: str, timestamp: datetime, request_input: int | None) -> float | None:
+        price, historical_fallback = self._price_at(model, timestamp)
+        # Only unknown model names use a proxy. Known models retain missing
+        # tier/context/history errors rather than silently changing their rate.
+        unknown = not any(p['model'] == model for p in self.data['prices'])
+        if price is None and unknown:
+            choices = []
+            available_models = {p['model'] for p in self.data['prices'] if p['tier'] == self.tier}
+            # Compare Codex model families, not unrelated legacy/API-only
+            # models such as GPT-5 Nano. Custom catalogs without these families
+            # use their own complete model list.
+            codex_models = {name for name in available_models
+                            if name == 'gpt-5.5' or re.fullmatch(
+                                r'gpt-\d+(?:\.\d+)?-(?:luna|sol|terra|astra|codex)(?:-.*)?', name)}
+            for candidate_model in sorted(codex_models or available_models):
+                candidate, historical = self._price_at(candidate_model, timestamp)
+                if candidate is not None:
+                    amount = self._amount(usage, candidate, request_input)
+                    if amount is not None:
+                        choices.append((amount, candidate['rates']['input'], candidate_model, candidate, historical))
+            if choices:
+                _, _, _, price, historical_fallback = min(choices, key=lambda c: c[:3])
+        if price is None:
             self.notes.add(f'No price for {model} ({self.tier}) at event time')
             return None
+        amount = self._amount(usage, price, request_input)
+        if amount is None:
+            self.notes.add(f'No applicable context/cache rate for {model}')
+            return None
+        if unknown:
+            self.notes.add(f'Estimated {model} using cheapest available Codex model: {price["model"]} ({self.tier})')
+            key = json.dumps([model, price['model']])
+            record = self.fallback_models.setdefault(key, dict(model=model, priced_as=price['model'], events=0, estimated_cost_usd=0.0))
+            record['events'] += 1
+            record['estimated_cost_usd'] += amount
+        if historical_fallback:
+            self.notes.add('Current published rates used before recorded history')
         self.used[json.dumps(price, sort_keys=True)] = price
         if price['date_basis'] == 'observed':
             self.notes.add('Price dates are observation dates, not verified effective dates')
         if request_input is None:
             self.notes.add('Missing request context size: short-context rates assumed')
-        prefix = 'long_' if request_input is not None and request_input > price['long_context_threshold'] else ''
-        rates = price['rates']
-        input_rate, cached_rate, output_rate = (rates[prefix + key] for key in ('input', 'cached_input', 'output'))
-        if input_rate is None or output_rate is None or (cached_rate is None and usage.cached_input_tokens):
-            self.notes.add(f'No applicable context/cache rate for {model}')
-            return None
-        return (usage.uncached_input_tokens * input_rate + usage.cached_input_tokens * (cached_rate or 0) + usage.output_tokens * output_rate) / 1_000_000
+        return amount
 
     def as_dict(self) -> dict:
         return dict(source=SOURCE_URL, checked_at=self.data['checked_at'], tier=self.tier,
                     strict_history=self.strict_history, rates=list(self.used.values()),
+                    fallback_models=list(self.fallback_models.values()),
                     notes=sorted(self.notes),
                     note='API-equivalent text cost; ChatGPT-auth Codex usage is not API billing. Cache writes, tools and regional surcharges are not included.')
 

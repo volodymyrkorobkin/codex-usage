@@ -156,6 +156,7 @@ For example, the published short-context Standard rates checked on October 8,
 | gpt-6-luna | 0.10 | 0.01 | 0.50 |
 | gpt-6-sol | 2.00 | 0.20 | 10.00 |
 | gpt-6.1-sol | 2.00 | 0.10 | 10.00 |
+| gpt-6-astra | 10.00 | 1.00 | 50.00 |
 
 Prompts above 272,000 input tokens use the published long-context rates for the
 whole request. Request size comes from `last_token_usage`, when it matches the
@@ -198,8 +199,20 @@ change. For events before available history, the default uses the latest
 published model price and explicitly labels that fallback. `--strict-pricing-history`
 disables that fallback. It does not turn observation dates into verified dates.
 
-Models without an exact published price, unsupported cache/context rates, or
-uncovered dates in strict mode have no estimated price. Mixed rows and the total
+Unknown models are estimated using the cheapest applicable published Codex model in
+the selected processing tier, according to that event's input/cache/output mix.
+With the current Standard prices, this is **GPT-6 Luna**. This applies to
+`codex-auto-review`, `gpt-reserve`, and missing model metadata. The report clearly
+labels the substitution; it is an estimate, not the unknown model's real price.
+The replacement obeys the same event-date/history and context rules as known
+models and is chosen dynamically from the loaded catalog, including custom
+pricing files.
+Candidate families are Luna, Sol, Terra, Astra, Codex and GPT-5.5. Unrelated
+API-only models such as GPT-5 Nano are excluded. A custom catalog containing
+none of these families uses all of its models as candidates.
+
+Known models with unsupported tiers/cache/context rates, or uncovered dates in
+strict mode, still have no estimated price. Mixed rows and the total
 still show the cost of priced events with an asterisk, such as `$12.34*`. The
 asterisk means **partial cost: unpriced events are excluded**. A row with no priced
 events shows `N/A`. All events remain included in token counts.
@@ -207,12 +220,15 @@ events shows `N/A`. All events remain included in token counts.
 `codex-auto-review` is a reviewer label found in Codex logs. Codex Auto-review
 checks eligible tool approval requests (see the
 [official documentation](https://learn.chatgpt.com/docs/cyber-safety/recommended-configuration)).
-The pricing source does not give this label an API rate, so the tool keeps its
-usage visible and unpriced rather than assigning another model's rate.
+The pricing source does not give this label an API rate, so the tool estimates
+its usage with the cheapest available model and identifies the assumption in
+the pricing notes. This does not identify the model behind the reviewer.
 
 JSON output includes `pricing.rates` with the model, tier, source, recorded
 start/end, date basis, and rates actually selected, plus pricing notes and
-`unpriced_events` in rows and totals. `known_cost_usd` contains the priced
+`pricing.fallback_models` with original/replacement model names, event counts
+and estimated subtotals. `unpriced_events` counts events without even an
+applicable fallback. `known_cost_usd` contains the priced
 subtotal and `priced_events` counts the events contributing to it.
 `estimated_cost_usd` remains `null` when any events are unpriced, so scripts can
 distinguish a complete estimate from a partial subtotal.

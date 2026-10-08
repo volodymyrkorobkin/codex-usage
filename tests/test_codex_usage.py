@@ -510,7 +510,8 @@ class PricingTests(unittest.TestCase):
     def test_unknown_and_historical_gaps_are_not_zero(self):
         pricing = codex_pricing.Pricing(self.data, strict_history=True)
         usage = codex_usage.Usage(input_tokens=10)
-        self.assertIsNone(pricing.cost(usage, 'unknown', self.stamp, 10))
+        self.assertAlmostEqual(pricing.cost(usage, 'unknown', self.stamp, 10), .00002)
+        self.assertIsNone(pricing.cost(usage, 'unknown', self.stamp - timedelta(days=1), 10))
         self.assertIsNone(pricing.cost(usage, 'gpt-6-sol', self.stamp - timedelta(days=1), 10))
         pricing = codex_pricing.Pricing(self.data)
         self.assertIsNotNone(pricing.cost(usage, 'gpt-6-sol', self.stamp - timedelta(days=1), 10))
@@ -548,15 +549,16 @@ class PricingTests(unittest.TestCase):
         self.assertIn('$4.20', codex_usage.render_report(models, limit=1, color=False))
         self.assertEqual(codex_usage.report_to_json(daily)['totals']['estimated_cost_usd'], 4.2)
 
-    def test_missing_model_marks_row_and_total_unavailable(self):
+    def test_missing_model_uses_cheapest_available_price(self):
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / 'rollout-fixture.jsonl'
             log.write_text(token_event('2026-10-01T01:00:00Z', dict(input_tokens=10, total_tokens=10)))
             report = codex_usage.build_report([Path(tmp)], self.stamp, self.stamp + timedelta(days=1),
                                               pricing=codex_pricing.Pricing(self.data))
-        self.assertEqual(report.unpriced_events, 1)
-        self.assertIsNone(report.estimated_cost_usd)
-        self.assertIsNone(codex_usage.report_to_json(report)['rows'][0]['estimated_cost_usd'])
+        self.assertEqual(report.unpriced_events, 0)
+        self.assertAlmostEqual(report.estimated_cost_usd, .00002)
+        self.assertAlmostEqual(codex_usage.report_to_json(report)['rows'][0]['estimated_cost_usd'], .00002)
+        self.assertEqual(report.pricing['fallback_models'][0]['priced_as'], 'gpt-6-sol')
 
     def test_auto_review_does_not_hide_priced_daily_usage(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -573,24 +575,65 @@ class PricingTests(unittest.TestCase):
                        for group in ('day', 'model')]
         daily, models = reports
         self.assertEqual(daily.totals.input_tokens, 101000)
-        self.assertEqual(daily.unpriced_events, 1)
-        self.assertEqual(daily.priced_events, 1)
-        self.assertIsNone(daily.estimated_cost_usd)
-        self.assertAlmostEqual(daily.known_cost_usd, 0.2)
-        self.assertEqual(codex_usage.display_cost(daily.rows[0]), '$0.20*')
+        self.assertEqual(daily.unpriced_events, 0)
+        self.assertEqual(daily.priced_events, 2)
+        self.assertAlmostEqual(daily.estimated_cost_usd, 0.202)
+        self.assertAlmostEqual(daily.known_cost_usd, 0.202)
+        self.assertEqual(codex_usage.display_cost(daily.rows[0]), '$0.20')
         for mode in ('full', 'compact', 'auto'):
             rendered = codex_usage.render_report(daily, color=False, table_mode=mode)
-            self.assertIn('$0.20*', rendered)
-            self.assertIn('Partial cost', rendered)
+            self.assertIn('$0.20', rendered)
+            self.assertIn('Estimated codex-auto-review using cheapest available Codex model: gpt-6-sol', rendered)
         rows = {row.label: row for row in models.rows}
-        self.assertEqual(codex_usage.display_cost(rows['codex-auto-review']), 'N/A')
+        self.assertEqual(codex_usage.display_cost(rows['codex-auto-review']), '$0.00')
         self.assertEqual(codex_usage.display_cost(rows['gpt-6-sol']), '$0.20')
-        self.assertIn('$0.20*', codex_usage.render_report(models, color=False, limit=1))
+        self.assertIn('$0.20', codex_usage.render_report(models, color=False, limit=1))
         data = codex_usage.report_to_json(daily)
-        self.assertEqual(data['rows'][0]['known_cost_usd'], 0.2)
-        self.assertEqual(data['totals']['known_cost_usd'], 0.2)
-        self.assertEqual(data['totals']['priced_events'], 1)
-        self.assertIsNone(data['totals']['estimated_cost_usd'])
+        self.assertAlmostEqual(data['rows'][0]['known_cost_usd'], 0.202)
+        self.assertAlmostEqual(data['totals']['known_cost_usd'], 0.202)
+        self.assertEqual(data['totals']['priced_events'], 2)
+        self.assertAlmostEqual(data['totals']['estimated_cost_usd'], 0.202)
+        self.assertEqual(data['pricing']['fallback_models'][0]['model'], 'codex-auto-review')
+
+    def test_unknown_model_uses_luna_and_discloses_proxy(self):
+        pricing = codex_pricing.Pricing(codex_pricing.bundled_catalog())
+        usage = codex_usage.Usage(input_tokens=1_000_000, cached_input_tokens=800_000,
+                                 output_tokens=10_000, reasoning_output_tokens=9000)
+        stamp = codex_pricing.utc(codex_pricing.BUNDLED_CHECKED_AT)
+        self.assertAlmostEqual(pricing.cost(usage, 'codex-auto-review', stamp, 1000), .033)
+        self.assertAlmostEqual(pricing.cost(usage, 'codex-auto-review', stamp, 300000), .0635)
+        fallback = pricing.as_dict()['fallback_models'][0]
+        self.assertEqual(fallback['priced_as'], 'gpt-6-luna')
+        self.assertEqual(fallback['events'], 2)
+        self.assertAlmostEqual(fallback['estimated_cost_usd'], .0965)
+
+    def test_cheapest_unknown_proxy_changes_with_prices_and_token_mix(self):
+        data = json.loads(json.dumps(self.data))
+        other = json.loads(json.dumps(data['prices'][0]))
+        other['model'] = 'gpt-6-terra'
+        other['rates'].update(input=5, output=1)
+        data['prices'].append(other)
+        pricing = codex_pricing.Pricing(data)
+        self.assertEqual(pricing.cost(codex_usage.Usage(output_tokens=1_000_000), 'new-model', self.stamp, 100), 1)
+        self.assertEqual(pricing.cost(codex_usage.Usage(input_tokens=1_000_000), 'new-model', self.stamp, 100), 2)
+        changed = self.stamp + timedelta(days=1)
+        rates = other['rates'].copy()
+        rates['output'] = 20
+        updated = codex_pricing.Pricing(codex_pricing.update_catalog(data, {('standard', other['model']): rates}, changed))
+        self.assertEqual(updated.cost(codex_usage.Usage(output_tokens=1_000_000), 'new-model', changed, 100), 10)
+
+    def test_unknown_proxy_respects_tier_context_and_history(self):
+        usage = codex_usage.Usage(input_tokens=1_000_000)
+        pricing = codex_pricing.Pricing(self.data, tier='fast')
+        self.assertIsNone(pricing.cost(usage, 'new-model', self.stamp, 100))
+        self.assertIsNone(pricing.cost(usage, 'gpt-6-sol', self.stamp, 100))
+        data = json.loads(json.dumps(self.data))
+        data['prices'][0]['rates']['cached_input'] = None
+        pricing = codex_pricing.Pricing(data)
+        self.assertIsNone(pricing.cost(codex_usage.Usage(input_tokens=100, cached_input_tokens=100), 'new-model', self.stamp, 100))
+        pricing = codex_pricing.Pricing(self.data)
+        self.assertEqual(pricing.cost(usage, 'new-model', self.stamp - timedelta(days=1), 100), 2)
+        self.assertIn('Current published rates used before recorded history', pricing.notes)
 
     def test_zero_priced_subtotal_is_distinct_from_no_priced_events(self):
         row = codex_usage.ReportRow('mixed', codex_usage.Usage(), 1,
