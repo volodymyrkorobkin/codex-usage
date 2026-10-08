@@ -2,6 +2,8 @@
 
 An unofficial local token usage reporter for OpenAI Codex CLI/Desktop sessions.
 
+This project is a fork of [hashmil/codex-usage](https://github.com/hashmil/codex-usage).
+
 `codex-usage` reads local Codex rollout JSONL files, deduplicates active and
 archived copies by session id, and renders a readable terminal table with token
 usage and an estimated API-equivalent cost.
@@ -39,7 +41,7 @@ Use `--codex-home` if your Codex home is somewhere else.
 Clone the repository:
 
 ```sh
-git clone https://github.com/<your-org-or-user>/codex-usage.git
+git clone https://github.com/volodymyrkorobkin/codex-usage.git
 cd codex-usage
 ```
 
