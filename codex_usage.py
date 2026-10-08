@@ -8,10 +8,12 @@ import re
 import shutil
 import sys
 import textwrap
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
+
+from codex_pricing import Pricing, TIERS, bundled_catalog, load_catalog
 
 
 TOKEN_KEYS = (
@@ -22,14 +24,6 @@ TOKEN_KEYS = (
     "total_tokens",
 )
 UNKNOWN_METADATA = "unknown"
-
-GPT55_INPUT_USD_PER_1M = 5.00
-GPT55_CACHED_INPUT_USD_PER_1M = 0.50
-GPT55_OUTPUT_USD_PER_1M = 30.00
-PRICING_LABEL = (
-    "Estimated with GPT-5.5 API text rates: "
-    "$5.00/M uncached input, $0.50/M cached input, $30.00/M output"
-)
 
 SESSION_ID_RE = re.compile(
     r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
@@ -105,6 +99,8 @@ class TokenEvent:
     session_id: str
     path: Path
     metadata: TurnMetadata
+    request_input_tokens: int | None = None
+    last_usage: Usage | None = None
 
 
 @dataclass(frozen=True)
@@ -115,6 +111,8 @@ class ReportRow:
     models: tuple[str, ...] = ()
     efforts: tuple[str, ...] = ()
     modes: tuple[str, ...] = ()
+    estimated_cost_usd: float | None = None
+    unpriced_events: int = 0
 
 
 @dataclass(frozen=True)
@@ -128,6 +126,9 @@ class Report:
     sessions_counted: int
     files_counted: int
     events_counted: int
+    estimated_cost_usd: float | None = None
+    unpriced_events: int = 0
+    pricing: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -217,6 +218,11 @@ def iter_token_events(path: Path) -> Iterable[TokenEvent]:
                 session_id=session_id,
                 path=path,
                 metadata=metadata,
+                request_input_tokens=(int(info["last_token_usage"]["input_tokens"])
+                                      if isinstance(info.get("last_token_usage"), dict)
+                                      and info["last_token_usage"].get("input_tokens") is not None else None),
+                last_usage=(Usage.from_mapping(info["last_token_usage"])
+                            if isinstance(info.get("last_token_usage"), dict) else None),
             )
 
 
@@ -360,11 +366,15 @@ def build_report(
     group_by: str = "day",
     title: str | None = None,
     tzinfo=None,
+    pricing: Pricing | None = None,
 ) -> Report:
     start = ensure_aware_utc(start)
     end = ensure_aware_utc(end)
     tzinfo = tzinfo or datetime.now().astimezone().tzinfo
 
+    pricing = pricing or Pricing(bundled_catalog())
+    grouped_costs: dict[str, float] = {}
+    grouped_unpriced: dict[str, int] = {}
     files = discover_rollout_files(roots)
     grouped: dict[str, Usage] = {}
     grouped_sessions: dict[str, set[str]] = {}
@@ -414,6 +424,16 @@ def build_report(
                     tzinfo,
                     event.metadata,
                 )
+            # Deltas may span multiple requests. Do not apply one request's long
+            # context rate to a cumulative multi-request delta.
+            request_input = event.request_input_tokens
+            if event.last_usage is not None and delta != event.last_usage:
+                request_input = None
+            cost = pricing.cost(delta, event.metadata.model, event.timestamp, request_input)
+            if cost is None:
+                grouped_unpriced[label] = grouped_unpriced.get(label, 0) + 1
+            else:
+                grouped_costs[label] = grouped_costs.get(label, 0.0) + cost
             grouped[label] = grouped.get(label, Usage()) + delta
             grouped_sessions.setdefault(label, set()).add(event.session_id)
             grouped_models.setdefault(label, set()).add(event.metadata.model)
@@ -434,6 +454,8 @@ def build_report(
             models=sorted_values(grouped_models.get(label, set())),
             efforts=sorted_values(grouped_efforts.get(label, set())),
             modes=sorted_values(grouped_modes.get(label, set())),
+            estimated_cost_usd=(None if grouped_unpriced.get(label) else grouped_costs.get(label, 0.0)),
+            unpriced_events=grouped_unpriced.get(label, 0),
         )
         for label, usage in grouped.items()
     ]
@@ -456,6 +478,9 @@ def build_report(
         sessions_counted=len(sessions_with_usage),
         files_counted=files_counted,
         events_counted=events_counted,
+        estimated_cost_usd=(None if grouped_unpriced else sum(grouped_costs.values())),
+        unpriced_events=sum(grouped_unpriced.values()),
+        pricing=pricing.as_dict(),
     )
 
 
@@ -463,16 +488,8 @@ def comma(value: int) -> str:
     return f"{value:,}"
 
 
-def estimate_cost_usd(usage: Usage) -> float:
-    return (
-        usage.uncached_input_tokens * GPT55_INPUT_USD_PER_1M
-        + usage.cached_input_tokens * GPT55_CACHED_INPUT_USD_PER_1M
-        + usage.output_tokens * GPT55_OUTPUT_USD_PER_1M
-    ) / 1_000_000
-
-
-def dollars(value: float) -> str:
-    return f"${value:,.2f}"
+def dollars(value: float | None) -> str:
+    return "N/A" if value is None else f"${value:,.2f}"
 
 
 def ansi(text: str, code: str, enabled: bool) -> str:
@@ -654,7 +671,7 @@ def value_for_column(key: str, row: ReportRow) -> str:
         "output": comma(row.usage.output_tokens),
         "reasoning": comma(row.usage.reasoning_output_tokens),
         "total": comma(row.usage.total_tokens),
-        "cost": dollars(estimate_cost_usd(row.usage)),
+        "cost": dollars(row.estimated_cost_usd),
     }
     return values[key]
 
@@ -680,7 +697,7 @@ def total_row_for_columns(
         "output": comma(total.output_tokens),
         "reasoning": comma(total.reasoning_output_tokens),
         "total": comma(total.total_tokens),
-        "cost": dollars(estimate_cost_usd(total)),
+        "cost": dollars(report.estimated_cost_usd),
     }
     return [values[column.key] for column in columns]
 
@@ -749,7 +766,7 @@ def make_title_box(
     ]
     content_width = max(
         20,
-        min(max(visible_len(text) for text, _ in items), max_width - 4),
+        min(max(visible_len(text) for text, _ in items), max_width - 6),
     )
     wrapped: list[tuple[str, str | None]] = []
     for text, style in items:
@@ -783,7 +800,16 @@ def render_report(
         f"{report.sessions_counted} sessions · {report.events_counted} token events · "
         f"{report.files_counted} rollout files"
     )
-    cost_note = PRICING_LABEL + "; reasoning is included in output"
+    tier = report.pricing.get("tier", "standard")
+    cost_note = f"Published OpenAI API text rates per model ({tier}); reasoning included in output"
+    if report.pricing.get("checked_at"):
+        cost_note += f"; prices checked {report.pricing['checked_at'][:10]}"
+    notes = report.pricing.get("notes", [])
+    if notes:
+        cost_note += ". " + "; ".join(notes)
+    if report.unpriced_events:
+        cost_note += f". N/A: {report.unpriced_events} events lack applicable prices"
+    cost_note += ". API-equivalent cost, not a ChatGPT bill"
     title_box = make_title_box(
         report.title,
         subtitle,
@@ -812,7 +838,8 @@ def report_to_json(report: Report) -> dict:
         "totals": {
             **report.totals.as_dict(),
             "uncached_input_tokens": report.totals.uncached_input_tokens,
-            "estimated_cost_usd": estimate_cost_usd(report.totals),
+            "estimated_cost_usd": report.estimated_cost_usd,
+            "unpriced_events": report.unpriced_events,
             "models": list(sorted_values(set(all_models))),
             "efforts": list(sorted_values(set(all_efforts))),
             "modes": list(sorted_values(set(all_modes))),
@@ -826,17 +853,12 @@ def report_to_json(report: Report) -> dict:
                 "modes": list(row.modes),
                 **row.usage.as_dict(),
                 "uncached_input_tokens": row.usage.uncached_input_tokens,
-                "estimated_cost_usd": estimate_cost_usd(row.usage),
+                "estimated_cost_usd": row.estimated_cost_usd,
+                "unpriced_events": row.unpriced_events,
             }
             for row in report.rows
         ],
-        "pricing": {
-            "model": "GPT-5.5",
-            "input_usd_per_1m": GPT55_INPUT_USD_PER_1M,
-            "cached_input_usd_per_1m": GPT55_CACHED_INPUT_USD_PER_1M,
-            "output_usd_per_1m": GPT55_OUTPUT_USD_PER_1M,
-            "note": "Estimate only. Local ChatGPT-auth Codex usage is not API billing.",
-        },
+        "pricing": report.pricing,
     }
 
 
@@ -876,6 +898,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="terminal color mode (default: auto)",
     )
+    parser.add_argument("--pricing-file", type=Path, help="use a local JSON price catalog, without fetching")
+    parser.add_argument("--pricing-tier", choices=TIERS, default="standard", help="API processing tier assumed for cost (default: standard)")
+    parser.add_argument("--offline", action="store_true", help="use cached or bundled prices without network access")
+    parser.add_argument("--refresh-prices", action="store_true", help="refresh the official price catalog now")
+    parser.add_argument("--strict-pricing-history", action="store_true", help="show N/A when event dates precede available price history")
     return parser
 
 
@@ -886,6 +913,15 @@ def main(argv: list[str] | None = None) -> int:
     if (args.since or args.until) and args.last != "30d":
         parser.error("--since/--until cannot be combined with --last")
 
+    if args.offline and args.refresh_prices:
+        parser.error("--offline cannot be combined with --refresh-prices")
+    if args.pricing_file and args.refresh_prices:
+        parser.error("--pricing-file cannot be combined with --refresh-prices")
+    try:
+        pricing = Pricing(load_catalog(args.pricing_file, args.offline, args.refresh_prices),
+                          tier=args.pricing_tier, strict_history=args.strict_pricing_history)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        parser.error(f"Invalid pricing catalog: {exc}")
     start, end, timeframe_label = resolve_timeframe(args)
     title = f"Codex Token Usage Report - {args.group_by.title()} · {timeframe_label}"
     report = build_report(
@@ -894,6 +930,7 @@ def main(argv: list[str] | None = None) -> int:
         end=end,
         group_by=args.group_by,
         title=title,
+        pricing=pricing,
     )
 
     if args.json:

@@ -6,7 +6,9 @@ An unofficial local token usage reporter for OpenAI Codex CLI/Desktop sessions.
 archived copies by session id, and renders a readable terminal table with token
 usage and an estimated API-equivalent cost.
 
-It runs entirely locally. It does not call external APIs.
+Logs are processed locally. Published prices are fetched from the official OpenAI
+documentation at most once per day; no logs are sent. Use `--offline` to disable
+network access. No API key or pricing server is needed.
 
 ## Features
 
@@ -17,7 +19,7 @@ It runs entirely locally. It does not call external APIs.
 - Rolling windows such as `24h`, `7d`, `30d`, `2w`, and `3m`.
 - Explicit date ranges with `--since` and `--until`.
 - JSON output for scripting.
-- Estimated `Cost (USD)` column using configurable assumptions in the source.
+- Model-specific published API text prices, long-context rates, and recorded price history.
 - No runtime dependencies outside Python's standard library.
 
 ## Requirements
@@ -132,22 +134,105 @@ table when it fits and falls back to a compact table when needed. `Models`,
 - `Total Tokens`: total tokens reported by Codex.
 - `Cost (USD)`: estimated API-equivalent cost.
 
-## Cost Estimate
+## API-equivalent Cost
 
 `Cost (USD)` is an estimate, not a real bill. Local ChatGPT-auth Codex usage is
 not API billing.
 
-The current default estimate uses GPT-5.5 API text pricing:
+The tool reads the labelled text pricing tables from the official
+[OpenAI pricing page](https://developers.openai.com/api/docs/pricing.md). Each
+usage event is priced using its model before aggregation, including model
+switches within a session. Reasoning is part of output and is never charged a
+second time. The default processing tier is **Standard**; Codex collaboration
+mode and reasoning effort are not processing tiers.
 
-- Uncached input: `$5.00 / 1M tokens`
-- Cached input: `$0.50 / 1M tokens`
-- Output: `$30.00 / 1M tokens`
+For example, the published short-context Standard rates checked on October 8,
+2026 are (USD per million tokens):
 
-Reasoning tokens are shown separately but are treated as part of output tokens,
-not billed a second time.
+| Model | Uncached input | Cached input | Output |
+| --- | ---: | ---: | ---: |
+| gpt-6-luna | 0.10 | 0.01 | 0.50 |
+| gpt-6-sol | 2.00 | 0.20 | 10.00 |
+| gpt-6.1-sol | 2.00 | 0.10 | 10.00 |
 
-Pricing changes over time. Check the official OpenAI pricing page before using
-the estimate for anything important.
+Prompts above 272,000 input tokens use the published long-context rates for the
+whole request. Request size comes from `last_token_usage`, when it matches the
+cumulative usage delta. If that information is absent or the delta covers
+multiple requests, short-context rates are assumed and the report says so.
+Cache writes, tool fees, regional premiums, and other account-specific charges
+are not included because rollout token totals do not identify them reliably.
+
+```sh
+# Same command as before; fetches/caches official prices automatically
+codex-usage --last-week --group-by model --table full
+
+# Refresh now, or run entirely offline
+codex-usage --refresh-prices
+codex-usage --offline
+
+# Explicit processing-tier assumption for the entire report
+codex-usage --pricing-tier fast
+
+# Require a recorded price period covering each event
+codex-usage --strict-pricing-history
+
+# Use your own price history without fetching anything
+codex-usage --pricing-file prices.json
+```
+
+### Price history and unavailable costs
+
+Prices are cached in `~/.cache/codex-usage/pricing.json` (or under
+`XDG_CACHE_HOME`; Windows uses `LOCALAPPDATA`). Refreshes preserve old price
+records and append changed prices with `start` inclusive and `end` exclusive,
+in UTC. An unchanged price keeps its original start date. The bundled snapshot
+provides prices when the cache or network is unavailable. Refresh failures warn
+on stderr and the report includes the last successful check date.
+
+The official page supplies **current prices, not historical effective dates**.
+Automatically collected periods have `date_basis: "observed"`: their start/end
+represent when this tool detected a change, which can be later than the actual
+change. For events before available history, the default uses the latest
+published model price and explicitly labels that fallback. `--strict-pricing-history`
+disables that fallback. It does not turn observation dates into verified dates.
+
+Models without an exact published price, unsupported cache/context rates, or
+uncovered dates in strict mode show `N/A` (`null` in JSON). If any event in a row
+is unpriced, that row and the overall total are unavailable; partial costs are
+never presented as a complete total. Token counts remain available.
+
+JSON output includes `pricing.rates` with the model, tier, source, recorded
+start/end, date basis, and rates actually selected, plus pricing notes and
+`unpriced_events` in rows and totals.
+
+A supplied `--pricing-file` uses the same schema. For independently verified
+historical periods, use `date_basis: "effective"` and cite the evidence in
+`source`. Dates must include a timezone; periods for a model/tier cannot overlap.
+A minimal catalog looks like this (the dates below illustrate the schema):
+
+```json
+{
+  "schema_version": 1,
+  "checked_at": "2026-10-08T00:00:00+00:00",
+  "prices": [
+    {
+      "model": "gpt-6-sol",
+      "tier": "standard",
+      "start": "2026-10-08T00:00:00+00:00",
+      "end": null,
+      "date_basis": "observed",
+      "source": "https://developers.openai.com/api/docs/pricing",
+      "long_context_threshold": 272000,
+      "rates": {
+        "input": 2.0, "cached_input": 0.2, "cache_write": 2.5, "output": 10.0,
+        "long_input": 4.0, "long_cached_input": 0.4,
+        "long_cache_write": 5.0, "long_output": 15.0
+      }
+    }
+  ]
+}
+```
+
 
 ## Shell Alias
 
@@ -180,7 +265,9 @@ python3 -m py_compile codex_usage.py
 ## Privacy
 
 This tool reads local Codex log files and prints aggregate token usage. It does
-not upload logs, send telemetry, or make network requests.
+not upload logs or send telemetry. Price refreshes make an HTTPS GET to the
+official public documentation; `--offline` and `--pricing-file` disable that
+request.
 
 If you share reports publicly, review them first. File paths, session dates, or
 session ids may reveal workflow details.
@@ -192,7 +279,8 @@ session ids may reveal workflow details.
 - Model, effort, and mode are inferred from structured `turn_context` records.
   Older logs without those records will show `unknown`.
 - Codex logs do not currently expose a reliable historical service tier per
-  token event, so the tool does not claim whether a past event used `fast`.
+  token event, so the tool does not claim whether a past event used `fast`. Standard is the default assumption; use
+  `--pricing-tier` to choose another tier for the report.
 
 ## License
 

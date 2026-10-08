@@ -7,6 +7,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import codex_usage
+import codex_pricing
+from unittest.mock import patch
+from datetime import timedelta
 
 
 def token_event(timestamp: str, total: dict[str, int], last: dict[str, int] | None = None) -> str:
@@ -341,7 +344,7 @@ class CodexUsageTests(unittest.TestCase):
         self.assertIn("1,240", rendered)
         self.assertIn("Total", rendered)
 
-    def test_estimated_cost_uses_gpt55_cached_and_uncached_rates(self) -> None:
+    def test_estimated_cost_uses_actual_model_rates(self) -> None:
         usage = codex_usage.Usage(
             input_tokens=2_000_000,
             cached_input_tokens=1_500_000,
@@ -350,9 +353,11 @@ class CodexUsageTests(unittest.TestCase):
             total_tokens=2_100_000,
         )
 
-        cost = codex_usage.estimate_cost_usd(usage)
-
-        self.assertAlmostEqual(cost, 6.25)
+        pricing = codex_pricing.Pricing(codex_pricing.bundled_catalog())
+        stamp = codex_pricing.utc(codex_pricing.BUNDLED_CHECKED_AT)
+        self.assertAlmostEqual(pricing.cost(usage, "gpt-6-sol", stamp, 1000), 2.3)
+        self.assertAlmostEqual(pricing.cost(usage, "gpt-6-luna", stamp, 1000), 0.115)
+        self.assertAlmostEqual(pricing.cost(usage, "gpt-6.1-sol", stamp, 1000), 2.15)
 
     def test_render_table_includes_estimated_cost_column(self) -> None:
         usage = codex_usage.Usage(
@@ -391,7 +396,7 @@ class CodexUsageTests(unittest.TestCase):
         )
 
         self.assertIn("Cost (USD)", rendered)
-        self.assertIn("$35.00", rendered)
+        self.assertIn("N/A", rendered)
 
     def test_auto_table_fits_requested_terminal_width(self) -> None:
         usage = codex_usage.Usage(
@@ -476,6 +481,139 @@ class CodexUsageTests(unittest.TestCase):
         self.assertIn("Cached Input", rendered)
         self.assertIn("Uncached", rendered)
         self.assertIn("Reasoning", rendered)
+
+
+class PricingTests(unittest.TestCase):
+    def setUp(self):
+        self.stamp = datetime(2026, 10, 1, tzinfo=timezone.utc)
+        rates = dict(input=2, cached_input=0.2, cache_write=2.5, output=10,
+                     long_input=4, long_cached_input=0.4, long_cache_write=5, long_output=15)
+        self.data = dict(schema_version=1, checked_at=self.stamp.isoformat(), prices=[
+            dict(model="gpt-6-sol", tier="standard", start=self.stamp.isoformat(),
+                 end=None, date_basis="effective", source=codex_pricing.SOURCE_URL,
+                 long_context_threshold=272000, rates=rates)])
+
+    def test_changes_preserve_history_and_exclusive_end(self):
+        changed = self.stamp + timedelta(days=1)
+        rates = self.data['prices'][0]['rates'].copy()
+        rates['input'] = 3
+        data = codex_pricing.update_catalog(self.data, {('standard', 'gpt-6-sol'): rates}, changed)
+        pricing = codex_pricing.Pricing(data)
+        usage = codex_usage.Usage(input_tokens=1_000_000)
+        self.assertEqual(pricing.cost(usage, 'gpt-6-sol', changed - timedelta(seconds=1), 100), 2)
+        self.assertEqual(pricing.cost(usage, 'gpt-6-sol', changed, 100), 3)
+        self.assertEqual(data['prices'][0]['end'], data['prices'][1]['start'])
+        same = codex_pricing.update_catalog(data, {('standard', 'gpt-6-sol'): rates}, changed + timedelta(days=1))
+        self.assertEqual(len(same['prices']), 2)
+        self.assertIsNone(self.data['prices'][0]['end'])
+
+    def test_unknown_and_historical_gaps_are_not_zero(self):
+        pricing = codex_pricing.Pricing(self.data, strict_history=True)
+        usage = codex_usage.Usage(input_tokens=10)
+        self.assertIsNone(pricing.cost(usage, 'unknown', self.stamp, 10))
+        self.assertIsNone(pricing.cost(usage, 'gpt-6-sol', self.stamp - timedelta(days=1), 10))
+        pricing = codex_pricing.Pricing(self.data)
+        self.assertIsNotNone(pricing.cost(usage, 'gpt-6-sol', self.stamp - timedelta(days=1), 10))
+        self.assertIn('Current published rates used before recorded history', pricing.notes)
+
+    def test_long_context_threshold_and_reasoning_not_double_counted(self):
+        pricing = codex_pricing.Pricing(self.data)
+        usage = codex_usage.Usage(input_tokens=1_000_000, cached_input_tokens=500_000,
+                                  output_tokens=100_000, reasoning_output_tokens=50_000)
+        self.assertAlmostEqual(pricing.cost(usage, 'gpt-6-sol', self.stamp, 272000), 2.1)
+        self.assertAlmostEqual(pricing.cost(usage, 'gpt-6-sol', self.stamp, 272001), 3.7)
+
+    def test_report_prices_mixed_models_before_grouping_and_keeps_full_total_with_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / 'rollout-fixture.jsonl'
+            log.write_text('\n'.join([
+                turn_context('2026-10-01T01:00:00Z', 'gpt-6-sol'),
+                token_event('2026-10-01T01:01:00Z', dict(input_tokens=1000000, output_tokens=0, total_tokens=1000000)),
+                turn_context('2026-10-01T02:00:00Z', 'gpt-6-luna'),
+                token_event('2026-10-01T02:01:00Z', dict(input_tokens=2000000, output_tokens=0, total_tokens=2000000),
+                            dict(input_tokens=1000000, output_tokens=0, total_tokens=1000000)),
+            ]))
+            data = json.loads(json.dumps(self.data))
+            luna = json.loads(json.dumps(data['prices'][0]))
+            luna['model'] = 'gpt-6-luna'
+            luna['rates']['long_input'] = 0.2
+            data['prices'].append(luna)
+            daily = codex_usage.build_report([Path(tmp)], self.stamp, self.stamp + timedelta(days=1),
+                                              pricing=codex_pricing.Pricing(data))
+            models = codex_usage.build_report([Path(tmp)], self.stamp, self.stamp + timedelta(days=1),
+                                               group_by='model', pricing=codex_pricing.Pricing(data))
+        self.assertAlmostEqual(daily.estimated_cost_usd, 4.2)
+        self.assertAlmostEqual(daily.rows[0].estimated_cost_usd, 4.2)
+        self.assertAlmostEqual(models.estimated_cost_usd, 4.2)
+        self.assertIn('$4.20', codex_usage.render_report(models, limit=1, color=False))
+        self.assertEqual(codex_usage.report_to_json(daily)['totals']['estimated_cost_usd'], 4.2)
+
+    def test_missing_model_marks_row_and_total_unavailable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / 'rollout-fixture.jsonl'
+            log.write_text(token_event('2026-10-01T01:00:00Z', dict(input_tokens=10, total_tokens=10)))
+            report = codex_usage.build_report([Path(tmp)], self.stamp, self.stamp + timedelta(days=1),
+                                              pricing=codex_pricing.Pricing(self.data))
+        self.assertEqual(report.unpriced_events, 1)
+        self.assertIsNone(report.estimated_cost_usd)
+        self.assertIsNone(codex_usage.report_to_json(report)['rows'][0]['estimated_cost_usd'])
+
+    def test_catalog_validation_rejects_overlaps_invalid_rates_and_dates(self):
+        for mutation in ('overlap', 'negative', 'naive'):
+            data = json.loads(json.dumps(self.data))
+            if mutation == 'overlap':
+                data['prices'].append(data['prices'][0].copy())
+            elif mutation == 'negative':
+                data['prices'][0]['rates']['input'] = -1
+            else:
+                data['prices'][0]['start'] = '2026-10-01'
+            with self.assertRaises(ValueError):
+                codex_pricing.validate_catalog(data)
+
+    def test_offline_does_not_fetch_and_file_is_authoritative(self):
+        with tempfile.TemporaryDirectory() as tmp, patch('codex_pricing.urllib.request.urlopen') as fetch:
+            file = Path(tmp) / 'pricing.json'
+            codex_pricing.write_catalog(file, self.data)
+            self.assertEqual(codex_pricing.load_catalog(file), self.data)
+            with patch('codex_pricing.default_cache_path', return_value=Path(tmp) / 'absent.json'):
+                self.assertTrue(codex_pricing.load_catalog(offline=True)['prices'])
+            fetch.assert_not_called()
+
+    def test_network_failure_falls_back_to_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp, patch('codex_pricing.default_cache_path', return_value=Path(tmp) / 'cache.json'), \
+                patch('codex_pricing.urllib.request.urlopen', side_effect=OSError('offline')):
+            with self.assertWarns(UserWarning):
+                data = codex_pricing.load_catalog(refresh=True)
+            self.assertTrue(data['prices'])
+
+    def test_multi_request_delta_does_not_inherit_last_request_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / 'rollout-fixture.jsonl'
+            log.write_text('\n'.join([
+                turn_context('2026-10-01T01:00:00Z', 'gpt-6-sol'),
+                token_event('2026-10-01T01:01:00Z', dict(input_tokens=600000, total_tokens=600000),
+                            dict(input_tokens=300000, total_tokens=300000))]))
+            report = codex_usage.build_report([Path(tmp)], self.stamp, self.stamp + timedelta(days=1),
+                                              pricing=codex_pricing.Pricing(self.data))
+        self.assertAlmostEqual(report.estimated_cost_usd, 1.2)
+        self.assertIn('Missing request context size: short-context rates assumed', report.pricing['notes'])
+
+    def test_parser_reads_exact_tiers_and_detects_format_drift(self):
+        text = """### Standard pricing data
+| Model | Short context input | Short context cached input | Short context cache writes | Short context output | Long context input | Long context cached input | Long context cache writes | Long context output |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| gpt-6-sol | $2.00 | $0.20 | $2.50 | $10.00 | $4.00 | $0.40 | $5.00 | $15.00 |
+### Fast pricing data
+| Model | Short context input | Short context cached input | Short context cache writes | Short context output | Long context input | Long context cached input | Long context cache writes | Long context output |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| gpt-6-sol | $4.00 | $0.40 | $5.00 | $20.00 | $8.00 | $0.80 | $10.00 | $30.00 |
+Short context: ≤272K input tokens. Long context: >272K input tokens.
+"""
+        prices = codex_pricing.parse_prices(text)
+        self.assertEqual(prices[('standard', 'gpt-6-sol')]['input'], 2)
+        self.assertEqual(prices[('fast', 'gpt-6-sol')]['input'], 4)
+        with self.assertRaises(ValueError):
+            codex_pricing.parse_prices(text.replace('Short context input', 'Input'))
 
 
 if __name__ == "__main__":

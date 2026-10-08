@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codex-usage"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local token usage reports for OpenAI Codex CLI/Desktop sessions"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -28,4 +28,4 @@ dependencies = []
 codex-usage = "codex_usage:main"
 
 [tool.setuptools]
-py-modules = ["codex_usage"]
+py-modules = ["codex_usage", "codex_pricing"]
