@@ -154,6 +154,40 @@ def session_id_for_path(path: Path) -> str:
     return match.group(1) if match else str(path)
 
 
+def load_session_titles(roots: Iterable[Path]) -> dict[str, str]:
+    """Read Codex's append-only name index, including renamed sessions."""
+    titles: dict[str, str] = {}
+    indexes = {
+        (root.parent if root.name in {"sessions", "archived_sessions"} else root)
+        / "session_index.jsonl"
+        for root in (Path(root).expanduser() for root in roots)
+    }
+    for index in sorted(indexes):
+        try:
+            with index.open("r", encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(record, dict):
+                        continue
+                    session_id = record.get("id")
+                    title = record.get("thread_name")
+                    if not isinstance(session_id, str) or not isinstance(title, str):
+                        continue
+                    # Keep user-supplied names on one line and strip terminal controls.
+                    title = " ".join(
+                        "".join(char for char in title if char.isprintable() or char.isspace()).split()
+                    )
+                    if title:
+                        titles[session_id] = title
+        except OSError:
+            # Names are optional; usage reports should work without the index.
+            continue
+    return titles
+
+
 def discover_rollout_files(roots: Iterable[Path]) -> list[Path]:
     by_session: dict[str, list[Path]] = {}
     for root in roots:
@@ -380,6 +414,8 @@ def build_report(
     grouped_costs: dict[str, float] = {}
     grouped_unpriced: dict[str, int] = {}
     grouped_priced: dict[str, int] = {}
+    roots = list(roots)
+    session_titles = load_session_titles(roots) if group_by == "session" else {}
     files = discover_rollout_files(roots)
     grouped: dict[str, Usage] = {}
     grouped_sessions: dict[str, set[str]] = {}
@@ -419,7 +455,8 @@ def build_report(
                         event.session_id,
                         tzinfo,
                         event.metadata,
-                    ),
+                    ) + (f" · {session_titles[event.session_id]}"
+                         if event.session_id in session_titles else ""),
                 )
             else:
                 label = group_label(
@@ -619,6 +656,8 @@ def make_table(
     def cell_lines(value: str, index: int) -> list[str]:
         if index not in wrap_columns:
             return str(value).splitlines() or [""]
+        if index == 0:
+            return wrap_text(str(value), widths[index])
         return wrap_metadata_text(str(value), widths[index])
 
     def line(values: list[str], style: str | None = None) -> list[str]:
@@ -654,7 +693,8 @@ def make_table(
 def table_columns(report: Report, table_mode: str) -> list[TableColumn]:
     sessions_header = "Sess" if table_mode == "compact" else "Sessions"
     common = [
-        TableColumn("label", label_header(report.group_by), "left"),
+        TableColumn("label", label_header(report.group_by), "left",
+                    wrap=report.group_by == "session", min_width=16),
         TableColumn("sessions", sessions_header, "right"),
         TableColumn("models", "Models", "left", wrap=True, min_width=8),
         TableColumn("efforts", "Efforts", "left", wrap=True, min_width=7),

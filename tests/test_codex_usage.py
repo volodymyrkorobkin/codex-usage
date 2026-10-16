@@ -197,6 +197,67 @@ class CodexUsageTests(unittest.TestCase):
         self.assertEqual(len(report.rows), 1)
         self.assertEqual(report.rows[0].sessions, 1)
         self.assertEqual(report.rows[0].usage.total_tokens, 270)
+        self.assertEqual(report.rows[0].label, "2026-06-01 01:00 99999999")
+
+    def test_session_names_preserve_time_and_distinct_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            active = home / "sessions" / "2026" / "06"
+            archived = home / "archived_sessions"
+            active.mkdir(parents=True)
+            archived.mkdir()
+            ids = ["aaaaaaaa-2222-3333-4444-555555555555",
+                   "bbbbbbbb-2222-3333-4444-555555555555"]
+            for root, session_id in zip((active, archived), ids):
+                (root / f"rollout-{session_id}.jsonl").write_text(
+                    token_event("2026-06-01T01:00:00Z", {"total_tokens": 100}),
+                    encoding="utf-8",
+                )
+            name = "Investigate, then repair the session usage report"
+            (home / "session_index.jsonl").write_text(
+                "\n".join([
+                    json.dumps({"id": ids[0], "thread_name": "Old name"}),
+                    "malformed record",
+                    "null",
+                    json.dumps({"id": ids[0], "thread_name": None}),
+                    *(json.dumps({"id": sid, "thread_name": name}) for sid in ids),
+                ]), encoding="utf-8",
+            )
+            report = codex_usage.build_report(
+                roots=iter([home / "sessions", archived]),
+                start=datetime(2026, 6, 1, tzinfo=timezone.utc),
+                end=datetime(2026, 6, 2, tzinfo=timezone.utc),
+                group_by="session",
+                tzinfo=timezone.utc,
+            )
+
+        self.assertEqual(len(report.rows), 2)
+        self.assertEqual(report.totals.total_tokens, 200)
+        self.assertEqual(
+            {row.label for row in report.rows},
+            {f"2026-06-01 01:00 {sid[:8]} · {name}" for sid in ids},
+        )
+        exported = codex_usage.report_to_json(report)
+        self.assertTrue(all(name in row["label"] for row in exported["rows"]))
+        rendered = codex_usage.render_usage_table(
+            report, report.rows, "auto", False, 80,
+        )
+        self.assertTrue(all(len(line) <= 80 for line in rendered.splitlines()), rendered)
+        self.assertIn("01:00", rendered)
+        self.assertIn("Investigate,", rendered)
+
+    def test_session_index_normalizes_names_and_ignores_blank_updates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "session_index.jsonl").write_text(
+                "\n".join(json.dumps(record) for record in [
+                    {"id": "example", "thread_name": " Fix\n\tusage\x07 reports "},
+                    {"id": "example", "thread_name": "   "},
+                    {"id": 123, "thread_name": "Invalid id"},
+                ]), encoding="utf-8",
+            )
+            self.assertEqual(codex_usage.load_session_titles([root]),
+                             {"example": "Fix usage reports"})
 
     def test_token_events_inherit_latest_turn_context_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

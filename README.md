@@ -124,6 +124,10 @@ The default `--table auto` mode detects the terminal width. It uses the full
 table when it fits and falls back to a compact table when needed. `Models`,
 `Efforts`, and `Modes` can wrap across multiple lines inside a row.
 
+- `Session`: with `--group-by session`, shows the date, time, short session ID,
+  and saved session name from `session_index.jsonl` in your Codex home. Long
+  names wrap to fit the terminal. If no saved name is available, the date,
+  time, and ID are still shown.
 - `Models`: model names from the most recent `turn_context` before each token
   event, such as `gpt-5.5`.
 - `Efforts`: reasoning effort from `turn_context`, such as `xhigh`.
