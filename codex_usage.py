@@ -24,6 +24,10 @@ TOKEN_KEYS = (
     "total_tokens",
 )
 UNKNOWN_METADATA = "unknown"
+SORT_FIELDS = (
+    "time", "name", "cost", "tokens", "total", "input", "cached-input",
+    "uncached-input", "output", "reasoning", "sessions", "user-messages",
+)
 
 SESSION_ID_RE = re.compile(
     r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
@@ -115,6 +119,9 @@ class ReportRow:
     unpriced_events: int = 0
     known_cost_usd: float = 0.0
     priced_events: int = 0
+    first_event_at: datetime | None = None
+    session_name: str | None = None
+    user_messages: int = 0
 
 
 @dataclass(frozen=True)
@@ -264,6 +271,51 @@ def iter_token_events(path: Path) -> Iterable[TokenEvent]:
             )
 
 
+def count_user_messages(path: Path, start: datetime, end: datetime) -> int:
+    """Count explicit user events, excluding response copies and injected context."""
+    legacy_count = 0
+    completed_count = 0
+    has_completed_users = False
+    seen_ids: set[str] = set()
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if '"user_message"' not in line and '"UserMessage"' not in line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, dict) or record.get("type") != "event_msg":
+                continue
+            payload = record.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            item = payload.get("item")
+            completed = (payload.get("type") == "item_completed"
+                         and isinstance(item, dict) and item.get("type") == "UserMessage")
+            if completed:
+                has_completed_users = True
+            elif payload.get("type") != "user_message":
+                continue
+            try:
+                timestamp = parse_timestamp(record["timestamp"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not start <= timestamp < end:
+                continue
+            if completed:
+                item_id = item.get("id")
+                if isinstance(item_id, str):
+                    if item_id in seen_ids:
+                        continue
+                    seen_ids.add(item_id)
+                completed_count += 1
+            else:
+                legacy_count += 1
+    # Some formats record both representations of each message.
+    return completed_count if has_completed_users else legacy_count
+
+
 def ensure_aware_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         value = value.replace(tzinfo=datetime.now().astimezone().tzinfo)
@@ -397,6 +449,47 @@ def summarize_values(values: Iterable[str], limit: int = 5) -> str:
     return ", ".join(unique[:limit]) + f", +{len(unique) - limit}"
 
 
+def sort_report_rows(
+    rows: list[ReportRow],
+    group_by: str,
+    sort_by: str | None = None,
+    descending: bool | None = None,
+) -> None:
+    """Sort in place, keeping unavailable costs last in either direction."""
+    if sort_by is not None and sort_by not in SORT_FIELDS:
+        raise ValueError(f"unknown sort field: {sort_by}")
+    field = sort_by or ("tokens" if group_by == "session" else "label")
+    if descending is None:
+        descending = field not in {"time", "name", "label"}
+
+    def value(row: ReportRow):
+        if field == "label":
+            return row.label
+        if field == "time":
+            return row.first_event_at or datetime.min.replace(tzinfo=timezone.utc)
+        if field == "name":
+            return (row.session_name or row.label).casefold()
+        if field == "cost":
+            return row.known_cost_usd
+        if field == "sessions":
+            return row.sessions
+        if field == "user-messages":
+            return row.user_messages
+        token_field = {
+            "tokens": "total_tokens", "total": "total_tokens",
+            "input": "input_tokens", "cached-input": "cached_input_tokens",
+            "uncached-input": "uncached_input_tokens", "output": "output_tokens",
+            "reasoning": "reasoning_output_tokens",
+        }[field]
+        return getattr(row.usage, token_field)
+
+    # Use the displayed label as a deterministic tie breaker.
+    rows.sort(key=lambda row: row.label)
+    rows.sort(key=value, reverse=descending)
+    if field == "cost":
+        rows.sort(key=lambda row: row.priced_events == 0)
+
+
 def build_report(
     roots: Iterable[Path],
     start: datetime,
@@ -405,6 +498,8 @@ def build_report(
     title: str | None = None,
     tzinfo=None,
     pricing: Pricing | None = None,
+    sort_by: str | None = None,
+    descending: bool | None = None,
 ) -> Report:
     start = ensure_aware_utc(start)
     end = ensure_aware_utc(end)
@@ -423,6 +518,8 @@ def build_report(
     grouped_efforts: dict[str, set[str]] = {}
     grouped_modes: dict[str, set[str]] = {}
     session_labels: dict[str, str] = {}
+    first_events: dict[str, datetime] = {}
+    grouped_user_messages: dict[str, int] = {}
     sessions_with_usage: set[str] = set()
     files_counted = 0
     events_counted = 0
@@ -472,6 +569,7 @@ def build_report(
             if event.last_usage is not None and delta != event.last_usage:
                 request_input = None
             cost = pricing.cost(delta, event.metadata.model, event.timestamp, request_input)
+            first_events[label] = min(first_events.get(label, event.timestamp), event.timestamp)
             if cost is None:
                 grouped_unpriced[label] = grouped_unpriced.get(label, 0) + 1
             else:
@@ -488,6 +586,8 @@ def build_report(
 
         if saw_event and file_had_window_usage:
             files_counted += 1
+            if group_by == "session":
+                grouped_user_messages[session_id_for_path(path)] = count_user_messages(path, start, end)
 
     rows = [
         ReportRow(
@@ -501,12 +601,13 @@ def build_report(
             unpriced_events=grouped_unpriced.get(label, 0),
             known_cost_usd=grouped_costs.get(label, 0.0),
             priced_events=grouped_priced.get(label, 0),
+            first_event_at=first_events[label],
+            session_name=session_titles.get(label),
+            user_messages=grouped_user_messages.get(label, 0),
         )
         for label, usage in grouped.items()
     ]
-    rows.sort(key=lambda row: row.label)
-    if group_by == "session":
-        rows.sort(key=lambda row: row.usage.total_tokens, reverse=True)
+    sort_report_rows(rows, group_by, sort_by, descending)
 
     totals = Usage()
     for row in rows:
@@ -692,10 +793,15 @@ def make_table(
 
 def table_columns(report: Report, table_mode: str) -> list[TableColumn]:
     sessions_header = "Sess" if table_mode == "compact" else "Sessions"
+    count_column = (
+        TableColumn("user_messages", "Msgs" if table_mode == "compact" else "User Messages", "right")
+        if report.group_by == "session"
+        else TableColumn("sessions", sessions_header, "right")
+    )
     common = [
         TableColumn("label", label_header(report.group_by), "left",
                     wrap=report.group_by == "session", min_width=16),
-        TableColumn("sessions", sessions_header, "right"),
+        count_column,
         TableColumn("models", "Models", "left", wrap=True, min_width=8),
         TableColumn("efforts", "Efforts", "left", wrap=True, min_width=7),
         TableColumn("modes", "Modes", "left", wrap=True, min_width=7),
@@ -720,6 +826,7 @@ def value_for_column(key: str, row: ReportRow) -> str:
     values = {
         "label": row.label,
         "sessions": comma(row.sessions),
+        "user_messages": comma(row.user_messages),
         "models": summarize_values(row.models),
         "efforts": summarize_values(row.efforts),
         "modes": summarize_values(row.modes),
@@ -746,6 +853,7 @@ def total_row_for_columns(
     values = {
         "label": "Total",
         "sessions": comma(report.sessions_counted),
+        "user_messages": comma(sum(row.user_messages for row in report.rows)),
         "models": summarize_values(all_models),
         "efforts": summarize_values(all_efforts),
         "modes": summarize_values(all_modes),
@@ -894,6 +1002,8 @@ def report_to_json(report: Report) -> dict:
         "files_counted": report.files_counted,
         "events_counted": report.events_counted,
         "totals": {
+            **({"user_messages": sum(row.user_messages for row in report.rows)}
+               if report.group_by == "session" else {}),
             **report.totals.as_dict(),
             "uncached_input_tokens": report.totals.uncached_input_tokens,
             "estimated_cost_usd": report.estimated_cost_usd,
@@ -908,6 +1018,7 @@ def report_to_json(report: Report) -> dict:
             {
                 "label": row.label,
                 "sessions": row.sessions,
+                **({"user_messages": row.user_messages} if report.group_by == "session" else {}),
                 "models": list(row.models),
                 "efforts": list(row.efforts),
                 "modes": list(row.modes),
@@ -945,6 +1056,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="aggregation level (default: day)",
     )
     parser.add_argument("--limit", type=int, help="limit displayed rows, useful with --group-by session")
+    parser.add_argument(
+        "--sort-by", choices=SORT_FIELDS,
+        help="sort rows (default: tokens for sessions, group label otherwise); "
+             "time uses the first usage event in the selected window",
+    )
+    order = parser.add_mutually_exclusive_group()
+    order.add_argument("--ascending", "--asc", dest="descending", action="store_false",
+                       help="sort smallest/oldest/A first")
+    order.add_argument("--descending", "--desc", dest="descending", action="store_true",
+                       help="sort largest/newest/Z first")
+    parser.set_defaults(descending=None)
     parser.add_argument("--codex-home", type=Path, default=Path.home() / ".codex")
     parser.add_argument("--json", action="store_true", help="emit JSON instead of a table")
     parser.add_argument(
@@ -993,6 +1115,8 @@ def main(argv: list[str] | None = None) -> int:
         group_by=args.group_by,
         title=title,
         pricing=pricing,
+        sort_by=args.sort_by,
+        descending=args.descending,
     )
 
     if args.json:

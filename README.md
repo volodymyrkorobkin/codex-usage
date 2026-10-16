@@ -91,6 +91,13 @@ codex-usage --since 2026-05-25 --until 2026-06-01
 # Biggest sessions in a rolling window
 codex-usage --last 7d --group-by session --limit 10
 
+# Newest sessions first (date and time remain visible)
+codex-usage --today --group-by session --sort-by time --descending
+
+# Session names A–Z, or most expensive sessions first
+codex-usage --today --group-by session --sort-by name --ascending
+codex-usage --today --group-by session --sort-by cost --descending
+
 # Group by week, month, model, reasoning effort, or mode
 codex-usage --last 3m --group-by week
 codex-usage --last 6m --group-by month
@@ -118,6 +125,24 @@ codex-usage --codex-home /path/to/.codex
 Supported duration units for `--last`: `h`, `d`, `w`, `m`.
 Examples: `24h`, `7d`, `30d`, `2w`, `3m`.
 
+### Sorting
+
+Use `--sort-by` with `time`, `name`, `cost`, `tokens` (or `total`), `input`,
+`cached-input`, `uncached-input`, `output`, `reasoning`, `sessions`, or
+`user-messages` (for session reports).
+Choose `--ascending` (`--asc`) or `--descending` (`--desc`) to set the direction.
+Time and name default to ascending; numeric fields default to descending.
+Without these flags, sessions still sort by total tokens descending and other
+groups sort by their displayed label ascending. A direction flag alone reverses
+or preserves that default sort field.
+
+Time sorts by the first usage event in each row within the selected window,
+matching the timestamp shown for sessions. Name uses the saved session name
+(case insensitive), falling back to the displayed label when unavailable; other
+groups use their displayed label. Cost uses the displayed priced subtotal,
+including partial estimates, and puts unavailable costs last in either direction.
+Sorting applies to both table and JSON output, before the table's `--limit`.
+
 ## Output Columns
 
 The default `--table auto` mode detects the terminal width. It uses the full
@@ -128,6 +153,10 @@ table when it fits and falls back to a compact table when needed. `Models`,
   and saved session name from `session_index.jsonl` in your Codex home. Long
   names wrap to fit the terminal. If no saved name is available, the date,
   time, and ID are still shown.
+- `User Messages`: replaces `Sessions` when grouping by session (`Msgs` in the
+  compact table). Counts explicit user messages within the selected time range,
+  excluding injected context and duplicate response records. Logs without user
+  message events show zero. JSON session rows and totals include `user_messages`.
 - `Models`: model names from the most recent `turn_context` before each token
   event, such as `gpt-5.5`.
 - `Efforts`: reasoning effort from `turn_context`, such as `xhigh`.

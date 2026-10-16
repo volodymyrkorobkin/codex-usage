@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import contextlib
+import io
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -10,6 +12,7 @@ import codex_usage
 import codex_pricing
 from unittest.mock import patch
 from datetime import timedelta
+from dataclasses import replace
 
 
 def token_event(timestamp: str, total: dict[str, int], last: dict[str, int] | None = None) -> str:
@@ -759,6 +762,188 @@ Short context: ≤272K input tokens. Long context: >272K input tokens.
         self.assertEqual(prices[('fast', 'gpt-6-sol')]['input'], 4)
         with self.assertRaises(ValueError):
             codex_pricing.parse_prices(text.replace('Short context input', 'Input'))
+
+
+class UserMessageTests(unittest.TestCase):
+    def message(self, timestamp, kind="legacy", item_id="message-1"):
+        if kind == "legacy":
+            payload = {"type": "user_message", "message": "Example request"}
+        else:
+            payload = {"type": "item_completed", "item": {"type": "UserMessage", "id": item_id}}
+        return json.dumps({"timestamp": timestamp, "type": "event_msg", "payload": payload})
+
+    def test_counts_both_log_formats_with_window_boundaries_and_deduplication(self):
+        start = datetime(2026, 6, 1, tzinfo=timezone.utc)
+        end = start + timedelta(days=1)
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "rollout-example.jsonl"
+            for kind in ("legacy", "completed"):
+                with self.subTest(kind=kind):
+                    records = [
+                        self.message("2026-05-31T23:59:59Z", kind, "before"),
+                        self.message("2026-06-01T00:00:00Z", kind, "first"),
+                        self.message("2026-06-01T12:00:00Z", kind, "second"),
+                        self.message("2026-06-02T00:00:00Z", kind, "after"),
+                        self.message("invalid", kind, "invalid"),
+                        '{"user_message": broken',
+                        json.dumps({"type": "response_item", "payload": {
+                            "type": "message", "role": "user", "content": "user_message"}}),
+                    ]
+                    if kind == "completed":
+                        records.extend([
+                            self.message("2026-06-01T12:00:00Z", kind, "second"),
+                            self.message("2026-06-01T12:00:00Z", "legacy"),
+                            json.dumps({"timestamp": "2026-06-01T12:00:00Z", "type": "event_msg",
+                                        "payload": {"type": "item_started", "item": {
+                                            "type": "UserMessage", "id": "second"}}}),
+                        ])
+                    log.write_text("\n".join(records), encoding="utf-8")
+                    self.assertEqual(codex_usage.count_user_messages(log, start, end), 2)
+
+    def test_session_table_json_and_totals_use_message_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            active, archived = root / "sessions", root / "archived_sessions"
+            active.mkdir()
+            archived.mkdir()
+            for index, count in enumerate((3, 1)):
+                name = f"rollout-{index}aaaaaaa-2222-3333-4444-555555555555.jsonl"
+                content = "\n".join([
+                    *(self.message(f"2026-06-01T0{hour}:00:00Z", item_id=str(hour))
+                      for hour in range(count)),
+                    token_event("2026-06-01T05:00:00Z", {"total_tokens": 100}),
+                ])
+                (active / name).write_text(content, encoding="utf-8")
+                (archived / name).write_text(content, encoding="utf-8")
+            report = codex_usage.build_report(
+                [active, archived], datetime(2026, 6, 1, tzinfo=timezone.utc),
+                datetime(2026, 6, 2, tzinfo=timezone.utc), group_by="session",
+                sort_by="user-messages",
+            )
+        self.assertEqual([row.user_messages for row in report.rows], [3, 1])
+        data = codex_usage.report_to_json(report)
+        self.assertEqual(data["totals"]["user_messages"], 4)
+        self.assertEqual(data["rows"][0]["user_messages"], 3)
+        for mode, header in [("full", "User Messages"), ("compact", "Msgs")]:
+            columns = codex_usage.table_columns(report, mode)
+            self.assertEqual(columns[1].header, header)
+            self.assertEqual(codex_usage.value_for_column(columns[1].key, report.rows[0]), "3")
+            # Limiting displayed rows must retain the total across all sessions.
+            total = codex_usage.total_row_for_columns(columns, report.rows[:1], report)
+            self.assertEqual(total[1], "4")
+        self.assertEqual(codex_usage.table_columns(replace(report, group_by="day"), "full")[1].header,
+                         "Sessions")
+
+
+class SortingTests(unittest.TestCase):
+    def setUp(self):
+        self.early = codex_usage.ReportRow(
+            label="2026-06-01 01:00 aaaaaaaa · zebra", sessions=1,
+            usage=codex_usage.Usage(input_tokens=10, cached_input_tokens=4,
+                                   output_tokens=2, reasoning_output_tokens=1,
+                                   total_tokens=12),
+            session_name="zebra", first_event_at=datetime(2026, 6, 1, 1, tzinfo=timezone.utc),
+            known_cost_usd=0.5, estimated_cost_usd=0.5, priced_events=1, user_messages=1,
+        )
+        self.late = codex_usage.ReportRow(
+            label="2026-06-01 02:00 bbbbbbbb · Alpha", sessions=2,
+            usage=codex_usage.Usage(input_tokens=20, cached_input_tokens=8,
+                                   output_tokens=4, reasoning_output_tokens=2,
+                                   total_tokens=24),
+            session_name="Alpha", first_event_at=datetime(2026, 6, 1, 2, tzinfo=timezone.utc),
+            known_cost_usd=1.0, estimated_cost_usd=1.0, priced_events=1, user_messages=2,
+        )
+
+    def test_time_and_name_use_metadata_instead_of_display_label(self):
+        for field, ascending in [("time", [self.early, self.late]),
+                                 ("name", [self.late, self.early])]:
+            for descending in (False, True):
+                with self.subTest(field=field, descending=descending):
+                    rows = [self.late, self.early]
+                    codex_usage.sort_report_rows(rows, "session", field, descending)
+                    self.assertEqual(rows, list(reversed(ascending)) if descending else ascending)
+
+    def test_numeric_fields_default_descending_and_allow_ascending(self):
+        for field in set(codex_usage.SORT_FIELDS) - {"time", "name"}:
+            with self.subTest(field=field):
+                rows = [self.early, self.late]
+                codex_usage.sort_report_rows(rows, "session", field)
+                self.assertEqual(rows, [self.late, self.early])
+                codex_usage.sort_report_rows(rows, "session", field, False)
+                self.assertEqual(rows, [self.early, self.late])
+
+    def test_default_order_is_preserved_and_direction_can_override_it(self):
+        for group, descending, expected in [
+            ("session", None, [self.late, self.early]),
+            ("day", None, [self.early, self.late]),
+            ("session", False, [self.early, self.late]),
+            ("day", True, [self.late, self.early]),
+        ]:
+            rows = [self.late, self.early]
+            codex_usage.sort_report_rows(rows, group, descending=descending)
+            self.assertEqual(rows, expected)
+
+    def test_cost_sorts_partial_subtotals_and_puts_unavailable_last(self):
+        partial = replace(self.early, estimated_cost_usd=None, unpriced_events=1)
+        unavailable = replace(self.late, label="Unavailable", known_cost_usd=0,
+                              estimated_cost_usd=None, priced_events=0, unpriced_events=1)
+        for descending, expected in [(True, [self.late, partial, unavailable]),
+                                     (False, [partial, self.late, unavailable])]:
+            rows = [unavailable, partial, self.late]
+            codex_usage.sort_report_rows(rows, "session", "cost", descending)
+            self.assertEqual(rows, expected)
+
+    def test_unnamed_rows_use_label_and_empty_reports_sort(self):
+        rows = [replace(self.early, session_name=None), replace(self.late, session_name=None)]
+        codex_usage.sort_report_rows(rows, "model", "name")
+        self.assertEqual(rows[0].label, self.early.label)
+        for field in codex_usage.SORT_FIELDS:
+            codex_usage.sort_report_rows([], "session", field)
+        with self.assertRaises(ValueError):
+            codex_usage.sort_report_rows([], "session", "invalid")
+
+    def test_parser_accepts_directions_and_rejects_conflicts(self):
+        parser = codex_usage.build_parser()
+        self.assertIsNone(parser.parse_args([]).descending)
+        for flag in ("--ascending", "--asc"):
+            self.assertFalse(parser.parse_args([flag]).descending)
+        for flag in ("--descending", "--desc"):
+            self.assertTrue(parser.parse_args([flag]).descending)
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["--ascending", "--descending"])
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["--sort-by", "invalid"])
+
+    def test_cli_sorting_applies_to_json_and_precedes_table_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            sessions = home / "sessions"
+            sessions.mkdir()
+            ids = ["aaaaaaaa-2222-3333-4444-555555555555",
+                   "bbbbbbbb-2222-3333-4444-555555555555"]
+            for sid, hour, total in zip(ids, (1, 2), (10, 20)):
+                (sessions / f"rollout-{sid}.jsonl").write_text(
+                    token_event(f"2026-06-01T0{hour}:00:00Z", {"total_tokens": total}),
+                    encoding="utf-8",
+                )
+            (home / "session_index.jsonl").write_text(
+                "\n".join(json.dumps({"id": sid, "thread_name": name})
+                          for sid, name in zip(ids, ("Zebra", "Alpha"))), encoding="utf-8",
+            )
+            args = ["--codex-home", tmp, "--since", "2026-06-01", "--until", "2026-06-01",
+                    "--group-by", "session", "--offline"]
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(codex_usage.main(args + ["--sort-by", "name", "--json"]), 0)
+            report = json.loads(output.getvalue())
+            self.assertIn("Alpha", report["rows"][0]["label"])
+            self.assertEqual(report["totals"]["total_tokens"], 30)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                codex_usage.main(args + ["--sort-by", "time", "--desc", "--limit", "1"])
+            self.assertIn("Alpha", output.getvalue())
+            self.assertNotIn("Zebra", output.getvalue())
 
 
 if __name__ == "__main__":
