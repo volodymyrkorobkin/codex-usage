@@ -24,44 +24,68 @@ def utc(value: str) -> datetime:
     return result.astimezone(timezone.utc)
 
 
+# Published column titles mapped to rate keys. The 30m write matches the former
+# single "cache writes" column; 12h writes have no catalog field and are unused.
+COLUMNS = {
+    'Short context input': 'input', 'Short context output': 'output',
+    'Short context cached input': 'cached_input', 'Short context 30m write': 'cache_write',
+    'Short context 12h write': None,
+    'Long context input': 'long_input', 'Long context output': 'long_output',
+    'Long context cached input': 'long_cached_input', 'Long context 30m write': 'long_cache_write',
+    'Long context 12h write': None,
+    'Input': 'input', 'Output': 'output', 'Cached input': 'cached_input',
+}
+LAYOUTS = (
+    ['Model', 'Short context input', 'Short context output', 'Short context cached input',
+     'Short context 30m write', 'Short context 12h write', 'Long context input',
+     'Long context output', 'Long context cached input', 'Long context 30m write',
+     'Long context 12h write'],
+    # Models without long-context pricing are listed in a separate table.
+    ['Model', 'Input', 'Output', 'Cached input'],
+)
+
+
 def parse_prices(markdown: str) -> dict:
     """Read only explicitly labelled text pricing tables; fail on format drift."""
     result = {}
     tier = None
-    expected = ['Model', 'Short context input', 'Short context cached input',
-                'Short context cache writes', 'Short context output',
-                'Long context input', 'Long context cached input',
-                'Long context cache writes', 'Long context output']
-    table = False
+    columns = None
     for line in markdown.splitlines():
         heading = re.fullmatch(r'### (Standard|Batch|Flex|Fast|Ultrafast) pricing data', line.strip())
-        if heading:
-            tier = heading[1].lower()
-            table = False
-        elif line.startswith('### '):
+        # Batch and Flex share one section, split by subheadings.
+        subheading = re.fullmatch(r'#### (Batch|Flex)', line.strip())
+        if heading or (tier and subheading):
+            tier = (heading or subheading)[1].lower()
+            columns = None
+        elif line.startswith('#'):
             tier = None
-            table = False
+            columns = None
         if not tier or not line.startswith('|'):
             continue
         cells = [part.strip() for part in line.strip().strip('|').split('|')]
         if cells[0] == 'Model':
-            if cells != expected:
+            if cells not in LAYOUTS:
                 raise ValueError('OpenAI pricing table columns changed')
-            table = True
+            columns = cells[1:]
             continue
-        if not table or cells[0].startswith('---'):
+        if columns is None or cells[0].startswith('---'):
             continue
-        if len(cells) != 9:
+        if len(cells) != len(columns) + 1:
             raise ValueError('OpenAI pricing table row changed')
         model = re.sub(r'\s+\(.*\)$', '', cells[0])
-        rates = {}
-        for key, cell in zip(RATE_KEYS, cells[1:]):
+        rates = dict.fromkeys(RATE_KEYS)
+        for title, cell in zip(columns, cells[1:]):
             if cell == '-':
-                rates[key] = None
+                value = None
             elif re.fullmatch(r'\$\d+(?:\.\d+)?', cell):
-                rates[key] = float(cell[1:])
+                value = float(cell[1:])
             else:
                 raise ValueError(f'Invalid published rate for {model}: {cell}')
+            if COLUMNS[title]:
+                rates[COLUMNS[title]] = value
+        # Some models appear in several sections (e.g. Cyber); they must agree.
+        if result.get((tier, model), rates) != rates:
+            raise ValueError(f'Conflicting {tier} prices for {model}')
         result[(tier, model)] = rates
     if not result or not any(t == 'standard' for t, _ in result):
         raise ValueError('No Standard text pricing table found')

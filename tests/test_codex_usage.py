@@ -195,6 +195,7 @@ class CodexUsageTests(unittest.TestCase):
                 start=datetime(2026, 6, 1, 0, 0, tzinfo=timezone.utc),
                 end=datetime(2026, 6, 2, 0, 0, tzinfo=timezone.utc),
                 group_by="session",
+                tzinfo=timezone.utc,
             )
 
         self.assertEqual(len(report.rows), 1)
@@ -747,21 +748,40 @@ class PricingTests(unittest.TestCase):
         self.assertIn('Missing request context size: short-context rates assumed', report.pricing['notes'])
 
     def test_parser_reads_exact_tiers_and_detects_format_drift(self):
-        text = """### Standard pricing data
-| Model | Short context input | Short context cached input | Short context cache writes | Short context output | Long context input | Long context cached input | Long context cache writes | Long context output |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| gpt-6-sol | $2.00 | $0.20 | $2.50 | $10.00 | $4.00 | $0.40 | $5.00 | $15.00 |
+        header = ('| Model | Short context input | Short context output | Short context cached input | '
+                  'Short context 30m write | Short context 12h write | Long context input | Long context output | '
+                  'Long context cached input | Long context 30m write | Long context 12h write |\n'
+                  '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n')
+        text = f"""### Standard pricing data
+{header}| gpt-6-sol | $2.00 | $10.00 | $0.20 | $2.50 | $5.00 | $4.00 | $15.00 | $0.40 | $5.00 | $10.00 |
+
+| Model | Input | Output | Cached input |
+| --- | --- | --- | --- |
+| gpt-4.1 | $2.00 | $8.00 | $0.50 |
+### Batch pricing data
+#### Batch
+{header}| gpt-6-sol | $1.00 | $5.00 | $0.10 | $1.25 | $2.50 | $2.00 | $7.50 | $0.20 | $2.50 | $5.00 |
+#### Flex
+{header}| gpt-6-sol | $1.50 | $5.00 | $0.10 | $1.25 | $2.50 | $2.00 | $7.50 | $0.20 | $2.50 | $5.00 |
 ### Fast pricing data
-| Model | Short context input | Short context cached input | Short context cache writes | Short context output | Long context input | Long context cached input | Long context cache writes | Long context output |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| gpt-6-sol | $4.00 | $0.40 | $5.00 | $20.00 | $8.00 | $0.80 | $10.00 | $30.00 |
+{header}| gpt-6-sol | $4.00 | $20.00 | $0.40 | $5.00 | $10.00 | $8.00 | $30.00 | $0.80 | $10.00 | $20.00 |
 Short context: ≤272K input tokens. Long context: >272K input tokens.
 """
         prices = codex_pricing.parse_prices(text)
-        self.assertEqual(prices[('standard', 'gpt-6-sol')]['input'], 2)
+        self.assertEqual(prices[('standard', 'gpt-6-sol')],
+                         dict(input=2, cached_input=0.2, cache_write=2.5, output=10,
+                              long_input=4, long_cached_input=0.4, long_cache_write=5, long_output=15))
+        self.assertEqual(prices[('standard', 'gpt-4.1')],
+                         dict(input=2, cached_input=0.5, cache_write=None, output=8,
+                              long_input=None, long_cached_input=None, long_cache_write=None, long_output=None))
+        self.assertEqual(prices[('batch', 'gpt-6-sol')]['input'], 1)
+        self.assertEqual(prices[('flex', 'gpt-6-sol')]['input'], 1.5)
         self.assertEqual(prices[('fast', 'gpt-6-sol')]['input'], 4)
         with self.assertRaises(ValueError):
             codex_pricing.parse_prices(text.replace('Short context input', 'Input'))
+        with self.assertRaises(ValueError):
+            codex_pricing.parse_prices(text + '### Standard pricing data\n' + header +
+                                       '| gpt-6-sol | $3.00 | $10.00 | $0.20 | $2.50 | $5.00 | $4.00 | $15.00 | $0.40 | $5.00 | $10.00 |\n')
 
 
 class UserMessageTests(unittest.TestCase):
