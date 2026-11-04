@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import contextlib
 import io
+import os
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -57,6 +58,58 @@ def turn_context(
 
 
 class CodexUsageTests(unittest.TestCase):
+    def test_compressed_report_matches_plain_including_metadata_and_messages(self) -> None:
+        start = datetime(2026, 6, 1, tzinfo=timezone.utc)
+        end = start + timedelta(days=1)
+        content = "\n".join([
+            turn_context("2026-06-01T00:00:00Z"),
+            token_event("2026-05-31T23:00:00Z", {"input_tokens": 100, "total_tokens": 100}),
+            "invalid JSON",
+            json.dumps({"timestamp": "2026-06-01T01:00:00Z", "type": "event_msg",
+                        "payload": {"type": "user_message", "message": "Hello"}}),
+            token_event("2026-06-01T01:01:00Z", {"input_tokens": 250, "total_tokens": 250}),
+        ]) + "\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            name = "rollout-2026-06-01T00-00-00-11111111-2222-3333-4444-555555555555.jsonl"
+            plain = root / name
+            plain.write_text(content, encoding="utf-8")
+            expected = codex_usage.build_report([root], start, end, group_by="session")
+            compressed = root / (name + ".zst")
+            # Two frames cover sessions compressed incrementally, with no content size.
+            with codex_usage.zstd.open(compressed, "wt", encoding="utf-8") as handle:
+                handle.write(content[:len(content) // 2])
+            with codex_usage.zstd.open(compressed, "at", encoding="utf-8") as handle:
+                handle.write(content[len(content) // 2:])
+            plain.unlink()
+            actual = codex_usage.build_report([root], start, end, group_by="session")
+            self.assertEqual(actual, expected)
+            self.assertEqual(actual.totals.total_tokens, 150)
+            self.assertEqual(actual.rows[0].user_messages, 1)
+            self.assertEqual(actual.rows[0].models, ("gpt-5.5",))
+            self.assertEqual(list(root.iterdir()), [compressed])
+
+    def test_discovery_deduplicates_compressed_and_plain_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            active = Path(tmp) / "sessions"
+            archived = Path(tmp) / "archived_sessions"
+            active.mkdir()
+            archived.mkdir()
+            name = "rollout-2026-06-01T00-00-00-11111111-2222-3333-4444-555555555555.jsonl"
+            plain = active / name
+            compressed = active / (name + ".zst")
+            archived_copy = archived / (name + ".zst")
+            for path in (plain, compressed, archived_copy):
+                path.touch()
+            (active / "rollout-unrelated.zip").touch()
+            (active / "rollout-directory.jsonl.zst").mkdir()
+            os.utime(plain, (100, 100))
+            os.utime(compressed, (200, 200))
+            os.utime(archived_copy, (300, 300))
+            self.assertEqual(codex_usage.discover_rollout_files([active, archived]), [compressed])
+            os.utime(plain, (400, 400))
+            self.assertEqual(codex_usage.discover_rollout_files([active, archived]), [plain])
+
     def test_default_window_is_last_30_days(self) -> None:
         parser = codex_usage.build_parser()
         args = parser.parse_args([])

@@ -4,9 +4,9 @@ An unofficial local token usage reporter for OpenAI Codex CLI/Desktop sessions.
 
 This project is a fork of [hashmil/codex-usage](https://github.com/hashmil/codex-usage).
 
-`codex-usage` reads local Codex rollout JSONL files, deduplicates active and
-archived copies by session id, and renders a readable terminal table with token
-usage and an estimated API-equivalent cost.
+`codex-usage` reads local Codex rollout JSONL files (including `.jsonl.zst`),
+deduplicates active and archived copies by session id, and renders a readable
+terminal table with token usage and an estimated API-equivalent cost.
 
 Logs are processed locally. Published prices are fetched from the official OpenAI
 documentation at most once per day; no logs are sent. Use `--offline` to disable
@@ -22,12 +22,15 @@ network access. No API key or pricing server is needed.
 - Explicit date ranges with `--since` and `--until`.
 - JSON output for scripting.
 - Model-specific published API text prices, long-context rates, and recorded price history.
-- No runtime dependencies outside Python's standard library.
+- Streams compressed sessions without extracting them to disk.
 
 ## Requirements
 
 - Python 3.10 or newer.
 - A local Codex install that writes rollout logs under `~/.codex`.
+
+Zstandard support uses Python 3.14's standard library. On Python 3.10–3.13,
+installation automatically includes the `zstandard` package.
 
 By default the tool reads:
 
@@ -62,6 +65,8 @@ You can also run it without installing:
 ```sh
 python3 codex_usage.py
 ```
+
+On Python 3.10–3.13, install `zstandard` first with `python3 -m pip install zstandard`.
 
 ## Examples
 

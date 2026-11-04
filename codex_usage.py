@@ -11,7 +11,12 @@ import textwrap
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, TextIO
+
+try:
+    from compression import zstd
+except ImportError:
+    import zstandard as zstd
 
 from codex_pricing import Pricing, TIERS, bundled_catalog, load_catalog
 
@@ -201,7 +206,9 @@ def discover_rollout_files(roots: Iterable[Path]) -> list[Path]:
         root = root.expanduser()
         if not root.exists():
             continue
-        for path in root.rglob("rollout-*.jsonl"):
+        for path in root.rglob("rollout-*"):
+            if not path.is_file() or not path.name.endswith((".jsonl", ".jsonl.zst")):
+                continue
             by_session.setdefault(session_id_for_path(path), []).append(path)
 
     files: list[Path] = []
@@ -227,10 +234,17 @@ def metadata_value(value) -> str:
     return value or UNKNOWN_METADATA
 
 
+def open_rollout(path: Path) -> TextIO:
+    """Stream plain or Zstandard-compressed JSONL without extracting files."""
+    if path.name.endswith(".jsonl.zst"):
+        return zstd.open(path, "rt", encoding="utf-8", errors="replace")
+    return path.open("r", encoding="utf-8", errors="replace")
+
+
 def iter_token_events(path: Path) -> Iterable[TokenEvent]:
     session_id = session_id_for_path(path)
     metadata = TurnMetadata()
-    with path.open("r", encoding="utf-8", errors="replace") as handle:
+    with open_rollout(path) as handle:
         for line in handle:
             if '"token_count"' not in line and '"turn_context"' not in line:
                 continue
@@ -277,7 +291,7 @@ def count_user_messages(path: Path, start: datetime, end: datetime) -> int:
     completed_count = 0
     has_completed_users = False
     seen_ids: set[str] = set()
-    with path.open("r", encoding="utf-8", errors="replace") as handle:
+    with open_rollout(path) as handle:
         for line in handle:
             if '"user_message"' not in line and '"UserMessage"' not in line:
                 continue
