@@ -221,6 +221,28 @@ codex-usage --strict-pricing-history
 codex-usage --pricing-file prices.json
 ```
 
+### Cost per user message
+
+```powershell
+codex-usage --today --group-by message
+codex-usage --last 7d --group-by message --sort-by cost --descending --limit 20
+codex-usage --today --group-by message --json --offline
+```
+
+Each row identifies a prompt by session, message number and text, and sums token
+usage recorded after it until the next explicit user message in that session.
+Repeated prompts remain separate. Prompts without recorded usage show zero;
+usage before the first recorded prompt appears as **Unattributed**. A prompt sent
+before the selected window can appear when its usage falls inside the window.
+JSON rows include `session_id`, `message_number`, `message` and `message_at`.
+Plain and compressed archives are supported.
+
+Costs are API-equivalent estimates for the work following a prompt, including
+context and tool follow-ups. They are not the cost of the prompt text alone or
+subscription billing. Concurrent or interrupted turns are attributed by log order;
+separate sub-agent sessions are not rolled into the parent prompt. Only explicit
+user events are used; injected context and response copies do not create rows.
+
 ### Price history and unavailable costs
 
 Prices are cached in `~/.cache/codex-usage/pricing.json` (or under
