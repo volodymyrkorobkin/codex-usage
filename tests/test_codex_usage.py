@@ -58,6 +58,59 @@ def turn_context(
 
 
 class CodexUsageTests(unittest.TestCase):
+    def test_message_groups_preserve_totals_and_distinguish_identical_prompts(self) -> None:
+        start = datetime(2026, 6, 1, tzinfo=timezone.utc)
+        def user(hour, text):
+            return json.dumps({"timestamp": f"2026-06-01T{hour:02d}:00:00Z", "type": "event_msg",
+                               "payload": {"type": "user_message", "message": text}})
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "rollout-11111111-2222-3333-4444-555555555555.jsonl"
+            path.write_text("\n".join([
+                turn_context("2026-06-01T00:00:00Z"),
+                token_event("2026-06-01T00:01:00Z", {"input_tokens": 10, "total_tokens": 10}),
+                user(1, "Same prompt"),
+                token_event("2026-06-01T01:01:00Z", {"input_tokens": 30, "total_tokens": 30}),
+                token_event("2026-06-01T01:02:00Z", {"input_tokens": 50, "total_tokens": 50}),
+                user(2, "Same prompt"),
+                token_event("2026-06-01T02:01:00Z", {"input_tokens": 80, "total_tokens": 80}),
+                user(3, "No reply yet"),
+            ]), encoding="utf-8")
+            report = codex_usage.build_report([root], start, start + timedelta(days=1), "message")
+            day = codex_usage.build_report([root], start, start + timedelta(days=1))
+            self.assertEqual(report.totals, day.totals)
+            self.assertAlmostEqual(report.known_cost_usd, day.known_cost_usd)
+            rows = {row.message_number: row for row in report.rows}
+            self.assertEqual(rows[1].usage.total_tokens, 40)
+            self.assertEqual(rows[2].usage.total_tokens, 30)
+            self.assertEqual(rows[3].usage.total_tokens, 0)
+            self.assertEqual(rows[None].usage.total_tokens, 10)
+            data = codex_usage.report_to_json(report)
+            self.assertEqual(next(row for row in data["rows"] if row["message_number"] == 1)["message"], "Same prompt")
+            # Compressed logs use the same message and token parsing.
+            with codex_usage.zstd.open(root / "rollout-11111111-2222-3333-4444-555555555555.jsonl.zst", "wt", encoding="utf-8") as handle:
+                handle.write(path.read_text(encoding="utf-8"))
+            path.unlink()
+            self.assertEqual(codex_usage.build_report([root], start, start + timedelta(days=1), "message"), report)
+            # A prompt before the window still owns its subsequent usage.
+            partial = codex_usage.build_report([root], start + timedelta(hours=1, minutes=1),
+                                               start + timedelta(hours=2), "message")
+            self.assertEqual(partial.rows[0].message_number, 1)
+            self.assertEqual(partial.totals.total_tokens, 40)
+
+    def test_completed_message_items_prefer_canonical_copy_and_deduplicate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout-test.jsonl"
+            completed = {"timestamp": "2026-06-01T01:00:00Z", "type": "event_msg",
+                         "payload": {"type": "item_completed", "item": {"type": "UserMessage",
+                                     "id": "one", "content": [{"type": "input_text", "text": "Hello"}]}}}
+            legacy = {"timestamp": "2026-06-01T01:00:00Z", "type": "event_msg",
+                      "payload": {"type": "user_message", "message": "Hello"}}
+            path.write_text("\n".join([json.dumps(legacy), json.dumps(completed), json.dumps(completed)]), encoding="utf-8")
+            messages = codex_usage.read_user_messages(path)
+            self.assertEqual(len(messages), 1)
+            self.assertEqual(messages[0].text, "Hello")
+
     def test_compressed_report_matches_plain_including_metadata_and_messages(self) -> None:
         start = datetime(2026, 6, 1, tzinfo=timezone.utc)
         end = start + timedelta(days=1)

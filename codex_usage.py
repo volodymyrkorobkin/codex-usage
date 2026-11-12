@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_right
 import json
 import os
 import re
@@ -110,6 +111,7 @@ class TokenEvent:
     metadata: TurnMetadata
     request_input_tokens: int | None = None
     last_usage: Usage | None = None
+    source_line: int = 0
 
 
 @dataclass(frozen=True)
@@ -127,6 +129,10 @@ class ReportRow:
     first_event_at: datetime | None = None
     session_name: str | None = None
     user_messages: int = 0
+    session_id: str | None = None
+    message_number: int | None = None
+    message: str | None = None
+    message_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -241,11 +247,57 @@ def open_rollout(path: Path) -> TextIO:
     return path.open("r", encoding="utf-8", errors="replace")
 
 
+@dataclass(frozen=True)
+class UserMessage:
+    source_line: int
+    timestamp: datetime
+    text: str
+
+
+def read_user_messages(path: Path) -> list[UserMessage]:
+    """Prefer completed user items over their legacy event copies."""
+    legacy: list[UserMessage] = []
+    completed: list[UserMessage] = []
+    seen_ids: set[str] = set()
+    with open_rollout(path) as handle:
+        for line_number, line in enumerate(handle):
+            if '"user_message"' not in line and '"UserMessage"' not in line:
+                continue
+            try:
+                record = json.loads(line)
+                if not isinstance(record, dict) or record.get("type") != "event_msg":
+                    continue
+                payload = record.get("payload") or {}
+                item = payload.get("item") or {}
+                is_completed = (payload.get("type") == "item_completed"
+                                and item.get("type") == "UserMessage")
+                if not is_completed and payload.get("type") != "user_message":
+                    continue
+                timestamp = parse_timestamp(record["timestamp"])
+                source = item if is_completed else payload
+                text = source.get("message") or source.get("content") or source.get("text") or ""
+                if isinstance(text, list):
+                    text = " ".join(part.get("text", "") for part in text if isinstance(part, dict))
+                if not isinstance(text, str):
+                    text = ""
+                text = " ".join("".join(c for c in text if c.isprintable() or c.isspace()).split())
+                if is_completed:
+                    item_id = item.get("id")
+                    if isinstance(item_id, str):
+                        if item_id in seen_ids:
+                            continue
+                        seen_ids.add(item_id)
+                (completed if is_completed else legacy).append(UserMessage(line_number, timestamp, text))
+            except (ValueError, KeyError, TypeError, AttributeError):
+                continue
+    return completed or legacy
+
+
 def iter_token_events(path: Path) -> Iterable[TokenEvent]:
     session_id = session_id_for_path(path)
     metadata = TurnMetadata()
     with open_rollout(path) as handle:
-        for line in handle:
+        for line_number, line in enumerate(handle):
             if '"token_count"' not in line and '"turn_context"' not in line:
                 continue
             try:
@@ -272,6 +324,7 @@ def iter_token_events(path: Path) -> Iterable[TokenEvent]:
                 continue
 
             yield TokenEvent(
+                source_line=line_number,
                 timestamp=timestamp,
                 usage=usage,
                 session_id=session_id,
@@ -443,6 +496,7 @@ def label_header(group_by: str) -> str:
         "week": "Week",
         "month": "Month",
         "session": "Session",
+        "message": "Message",
         "model": "Model",
         "effort": "Effort",
         "mode": "Mode",
@@ -534,11 +588,25 @@ def build_report(
     session_labels: dict[str, str] = {}
     first_events: dict[str, datetime] = {}
     grouped_user_messages: dict[str, int] = {}
+    message_details: dict[str, tuple[str, int, UserMessage]] = {}
     sessions_with_usage: set[str] = set()
     files_counted = 0
     events_counted = 0
 
     for path in files:
+        messages = read_user_messages(path) if group_by == "message" else []
+        message_lines = [message.source_line for message in messages]
+        if group_by == "message":
+            session_id = session_id_for_path(path)
+            for number, message in enumerate(messages, 1):
+                key = f"{session_id}:{number}"
+                message_details[key] = (session_id, number, message)
+                session_labels[key] = (f"{message.timestamp.astimezone(tzinfo):%Y-%m-%d %H:%M} "
+                                       f"{session_id[:8]} #{number} · {message.text or '[Attachment]'}")
+                if start <= message.timestamp < end:
+                    grouped[key] = Usage()
+                    grouped_sessions[key] = {session_id}
+                    first_events[key] = message.timestamp
         previous = Usage()
         saw_event = False
         file_had_window_usage = False
@@ -556,7 +624,16 @@ def build_report(
             if delta.total_tokens == 0:
                 continue
 
-            if group_by == "session":
+            if group_by == "message":
+                number = bisect_right(message_lines, event.source_line)
+                label = f"{event.session_id}:{number}"
+                if number:
+                    message = messages[number - 1]
+                    session_labels[label] = (f"{message.timestamp.astimezone(tzinfo):%Y-%m-%d %H:%M} "
+                                             f"{event.session_id[:8]} #{number} · {message.text or '[Attachment]'}")
+                else:
+                    session_labels[label] = f"{event.session_id[:8]} · Unattributed"
+            elif group_by == "session":
                 label = event.session_id
                 session_labels.setdefault(
                     event.session_id,
@@ -618,6 +695,10 @@ def build_report(
             first_event_at=first_events[label],
             session_name=session_titles.get(label),
             user_messages=grouped_user_messages.get(label, 0),
+            session_id=(label.rsplit(":", 1)[0] if group_by == "message" else None),
+            message_number=(message_details[label][1] if label in message_details else None),
+            message=(message_details[label][2].text if label in message_details else None),
+            message_at=(message_details[label][2].timestamp if label in message_details else None),
         )
         for label, usage in grouped.items()
     ]
@@ -814,7 +895,7 @@ def table_columns(report: Report, table_mode: str) -> list[TableColumn]:
     )
     common = [
         TableColumn("label", label_header(report.group_by), "left",
-                    wrap=report.group_by == "session", min_width=16),
+                    wrap=report.group_by in {"session", "message"}, min_width=16),
         count_column,
         TableColumn("models", "Models", "left", wrap=True, min_width=8),
         TableColumn("efforts", "Efforts", "left", wrap=True, min_width=7),
@@ -1032,6 +1113,10 @@ def report_to_json(report: Report) -> dict:
             {
                 "label": row.label,
                 "sessions": row.sessions,
+                **({"session_id": row.session_id, "message_number": row.message_number,
+                    "message": row.message,
+                    "message_at": row.message_at.isoformat() if row.message_at else None}
+                   if report.group_by == "message" else {}),
                 **({"user_messages": row.user_messages} if report.group_by == "session" else {}),
                 "models": list(row.models),
                 "efforts": list(row.efforts),
@@ -1065,7 +1150,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--until", help="end date, inclusive, local time, YYYY-MM-DD")
     parser.add_argument(
         "--group-by",
-        choices=("day", "week", "month", "session", "model", "effort", "mode", "model-effort"),
+        choices=("day", "week", "month", "session", "message", "model", "effort", "mode", "model-effort"),
         default="day",
         help="aggregation level (default: day)",
     )
